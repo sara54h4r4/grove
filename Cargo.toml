@@ -66,6 +66,9 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # Bytes
 bytes = "1"
 
+# Config
+toml = "0.8"
+
 # System
 libc = "0.2"
 

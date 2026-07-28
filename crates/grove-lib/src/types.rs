@@ -41,6 +41,14 @@ pub struct FileActivity {
     pub change_count: u64,
 }
 
+// === Agent Assignment ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAssignment {
+    pub workspace_id: WorkspaceId,
+    pub agent_name: String,
+}
+
 // === Change Analysis ===
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

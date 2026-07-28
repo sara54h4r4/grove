@@ -3,6 +3,7 @@ use grove_lib::graph::{GraphOverlay, ImportGraph};
 use grove_lib::{
     CommitHash, FileActivity, OrthogonalityScore, Workspace, WorkspaceId, WorkspacePairAnalysis,
 };
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
+use crate::agent_config::{self, AgentsConfig};
 use crate::db::Database;
 use crate::worker::{WorkerMessage, build_base_graph_from_workspace, canonical_pair};
 
@@ -28,6 +30,7 @@ pub struct GroveConfig {
     pub circuit_breaker_threshold: usize,
     pub ignore_patterns: Vec<String>,
     pub respect_gitignore: bool,
+    pub grove_dir: Option<PathBuf>,
 }
 
 impl Default for GroveConfig {
@@ -53,6 +56,7 @@ impl Default for GroveConfig {
                 "*.map".to_string(),
             ],
             respect_gitignore: true,
+            grove_dir: None,
         }
     }
 }
@@ -127,6 +131,11 @@ pub enum QueryRequest {
     AwaitAnalysis {
         timeout_ms: u64,
     },
+    GetFileActivity {
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<usize>,
+    },
+    GetAgentAssignments,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +153,8 @@ pub enum QueryResponse {
         in_flight: usize,
         analysis_count: usize,
     },
+    FileActivity(Vec<FileActivity>),
+    AgentAssignments(Vec<grove_lib::AgentAssignment>),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -183,6 +194,7 @@ pub struct DaemonState {
     dirty_workspaces: Vec<WorkspaceId>,
     in_flight_pairs: HashSet<(WorkspaceId, WorkspaceId)>,
     file_activity: HashMap<WorkspaceId, HashMap<PathBuf, FileActivity>>,
+    agent_config: Option<AgentsConfig>,
     analysis_waiters: Vec<oneshot::Sender<QueryResponse>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
@@ -213,6 +225,7 @@ impl DaemonState {
             dirty_workspaces: Vec::new(),
             in_flight_pairs: HashSet::new(),
             file_activity: HashMap::new(),
+            agent_config: None,
             analysis_waiters: Vec::new(),
             event_tx,
             worker_tx: None,
@@ -249,6 +262,22 @@ impl DaemonState {
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load pair analyses from db");
+                }
+            }
+        }
+
+        // Load agent assignment configuration
+        if let Some(ref grove_dir) = self.config.grove_dir {
+            match agent_config::load_agents_config(grove_dir) {
+                Ok(Some(cfg)) => {
+                    info!(count = cfg.agents.len(), "loaded agent assignment config");
+                    self.agent_config = Some(cfg);
+                }
+                Ok(None) => {
+                    debug!("no agents.toml found, using fallback assignments");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load agent config");
                 }
             }
         }
@@ -569,6 +598,35 @@ impl DaemonState {
             QueryRequest::AwaitAnalysis { timeout_ms } => {
                 self.handle_await_analysis_query(timeout_ms, reply);
             }
+            QueryRequest::GetFileActivity {
+                workspace_id,
+                limit,
+            } => {
+                let mut all = Vec::new();
+                match workspace_id {
+                    Some(wid) => {
+                        if let Some(per_ws) = self.file_activity.get(&wid) {
+                            all.extend(per_ws.values().cloned());
+                        }
+                    }
+                    None => {
+                        for per_ws in self.file_activity.values() {
+                            all.extend(per_ws.values().cloned());
+                        }
+                    }
+                }
+                all.sort_by_key(|a| Reverse(a.last_changed_at));
+                if let Some(limit) = limit {
+                    all.truncate(limit);
+                }
+                Self::send_query_reply(reply, QueryResponse::FileActivity(all));
+            }
+            QueryRequest::GetAgentAssignments => {
+                let workspaces: Vec<Workspace> = self.workspaces.values().cloned().collect();
+                let assignments =
+                    agent_config::resolve_assignments(&self.agent_config, &workspaces);
+                Self::send_query_reply(reply, QueryResponse::AgentAssignments(assignments));
+            }
         }
     }
 
@@ -589,7 +647,9 @@ impl DaemonState {
             | QueryRequest::GetWorkspace { .. }
             | QueryRequest::GetPairAnalysis { .. }
             | QueryRequest::GetAllAnalyses
-            | QueryRequest::GetStatus => {
+            | QueryRequest::GetStatus
+            | QueryRequest::GetFileActivity { .. }
+            | QueryRequest::GetAgentAssignments => {
                 self.handle_query(request, reply);
             }
         }
@@ -2449,5 +2509,99 @@ mod tests {
 
         state.handle_remove_workspace(ws_id).unwrap();
         assert!(!state.file_activity.contains_key(&ws_id));
+    }
+
+    // ── File activity query ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_file_activity_query_returns_flattened_sorted_results() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root_a = PathBuf::from("/tmp/worktree-a");
+        let root_b = PathBuf::from("/tmp/worktree-b");
+        let ws_a = make_workspace_at_path("a", "main", root_a.clone());
+        let ws_b = make_workspace_at_path("b", "main", root_b.clone());
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+        state.handle_register_workspace(ws_a).unwrap();
+        state.handle_register_workspace(ws_b).unwrap();
+
+        state
+            .handle_file_changed(id_a, &root_a.join("src/a.rs"))
+            .await;
+        state
+            .handle_file_changed(id_b, &root_b.join("src/b.rs"))
+            .await;
+        state
+            .handle_file_changed(id_a, &root_a.join("src/a2.rs"))
+            .await;
+
+        // Query all — should get 3 entries sorted newest first
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(
+            QueryRequest::GetFileActivity {
+                workspace_id: None,
+                limit: None,
+            },
+            reply_tx,
+        );
+        let result = reply_rx.await.unwrap();
+        let activities = match result {
+            QueryResponse::FileActivity(a) => a,
+            other => panic!("expected FileActivity, got: {other:?}"),
+        };
+        assert_eq!(activities.len(), 3);
+
+        // Query filtered by workspace
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(
+            QueryRequest::GetFileActivity {
+                workspace_id: Some(id_a),
+                limit: None,
+            },
+            reply_tx,
+        );
+        let result = reply_rx.await.unwrap();
+        let activities = match result {
+            QueryResponse::FileActivity(a) => a,
+            other => panic!("expected FileActivity, got: {other:?}"),
+        };
+        assert_eq!(activities.len(), 2);
+        assert!(activities.iter().all(|a| a.workspace_id == id_a));
+
+        // Query with limit
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(
+            QueryRequest::GetFileActivity {
+                workspace_id: None,
+                limit: Some(1),
+            },
+            reply_tx,
+        );
+        let result = reply_rx.await.unwrap();
+        let activities = match result {
+            QueryResponse::FileActivity(a) => a,
+            other => panic!("expected FileActivity, got: {other:?}"),
+        };
+        assert_eq!(activities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_agent_assignments_query_returns_fallback_names() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let ws = make_workspace("test-ws");
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(QueryRequest::GetAgentAssignments, reply_tx);
+        let result = reply_rx.await.unwrap();
+        let assignments = match result {
+            QueryResponse::AgentAssignments(a) => a,
+            other => panic!("expected AgentAssignments, got: {other:?}"),
+        };
+        assert_eq!(assignments.len(), 1);
+        // Without agents.toml, fallback to workspace name
+        assert_eq!(assignments[0].workspace_id, ws_id);
+        assert_eq!(assignments[0].agent_name, "test-ws");
     }
 }

@@ -147,6 +147,34 @@ fn parse_request(request: &SocketRequest) -> Result<ParsedRequest, String> {
                 timeout_ms,
             }))
         }
+        "get_agent_assignments" => Ok(ParsedRequest::Query(QueryRequest::GetAgentAssignments)),
+        "get_file_activity" => {
+            let workspace_id = match request.params.get("workspace_id") {
+                Some(value) => {
+                    let s = value
+                        .as_str()
+                        .ok_or_else(|| "invalid workspace_id: expected string".to_string())?;
+                    Some(
+                        s.parse::<WorkspaceId>()
+                            .map_err(|e| format!("invalid workspace_id: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+            let limit = match request.params.get("limit") {
+                Some(value) => {
+                    let n = value
+                        .as_u64()
+                        .ok_or_else(|| "invalid limit: expected unsigned integer".to_string())?;
+                    Some(n as usize)
+                }
+                None => None,
+            };
+            Ok(ParsedRequest::Query(QueryRequest::GetFileActivity {
+                workspace_id,
+                limit,
+            }))
+        }
         "subscribe" => Ok(ParsedRequest::Subscribe),
         "sync_worktrees" => {
             let worktrees = request
@@ -241,6 +269,14 @@ fn query_response_to_socket(response: QueryResponse) -> SocketResponse {
             });
             SocketResponse::success(data)
         }
+        QueryResponse::FileActivity(activities) => match serde_json::to_value(&activities) {
+            Ok(data) => SocketResponse::success(data),
+            Err(e) => SocketResponse::error(format!("serialization error: {e}")),
+        },
+        QueryResponse::AgentAssignments(assignments) => match serde_json::to_value(&assignments) {
+            Ok(data) => SocketResponse::success(data),
+            Err(e) => SocketResponse::error(format!("serialization error: {e}")),
+        },
     }
 }
 
@@ -792,7 +828,9 @@ async fn handle_request_with_options(
             | QueryRequest::GetWorkspace { .. }
             | QueryRequest::GetPairAnalysis { .. }
             | QueryRequest::GetAllAnalyses
-            | QueryRequest::GetStatus => {
+            | QueryRequest::GetStatus
+            | QueryRequest::GetFileActivity { .. }
+            | QueryRequest::GetAgentAssignments => {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let message = StateMessage::Query {
                     request: query,
@@ -923,6 +961,8 @@ async fn await_analysis_timeout_response(
         | Ok(Ok(QueryResponse::PairAnalysis(_)))
         | Ok(Ok(QueryResponse::AllAnalyses(_)))
         | Ok(Ok(QueryResponse::Status { .. }))
+        | Ok(Ok(QueryResponse::FileActivity(_)))
+        | Ok(Ok(QueryResponse::AgentAssignments(_)))
         | Ok(Err(_))
         | Err(_) => fallback,
     }
@@ -2539,6 +2579,132 @@ mod tests {
 
         state_tx.send(StateMessage::Shutdown).await.unwrap();
         state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_request_get_file_activity_returns_activity() {
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        // Register a workspace with a path we can use for absolute-path changes
+        let ws = Workspace {
+            id: Uuid::new_v4(),
+            name: "test".to_string(),
+            branch: "main".to_string(),
+            path: PathBuf::from("/tmp/worktree-test"),
+            base_ref: "main".to_string(),
+            created_at: Utc::now(),
+            last_activity: Utc::now(),
+            metadata: WorkspaceMetadata::default(),
+        };
+        let ws_id = ws.id;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state_tx
+            .send(StateMessage::RegisterWorkspace {
+                workspace: ws,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        // Send a file change with an absolute path inside the worktree
+        state_tx
+            .send(StateMessage::FileChanged {
+                workspace_id: ws_id,
+                path: PathBuf::from("/tmp/worktree-test/src/lib.rs"),
+            })
+            .await
+            .unwrap();
+        // Small sleep so the actor processes the message
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Query file activity (no filter)
+        let response =
+            handle_request(r#"{"method":"get_file_activity","params":{}}"#, &state_tx).await;
+        assert!(response.ok, "expected ok, got error: {:?}", response.error);
+        let activities = response.data.unwrap();
+        let arr = activities.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["workspace_id"], serde_json::json!(ws_id.to_string()));
+        assert_eq!(arr[0]["relative_path"], "src/lib.rs");
+        assert_eq!(arr[0]["change_count"], 1);
+
+        // Query with workspace_id filter
+        let filtered = handle_request(
+            &format!(
+                r#"{{"method":"get_file_activity","params":{{"workspace_id":"{wid}"}}}}"#,
+                wid = ws_id
+            ),
+            &state_tx,
+        )
+        .await;
+        assert!(filtered.ok);
+        assert_eq!(filtered.data.unwrap().as_array().unwrap().len(), 1);
+
+        // Query with unknown workspace_id returns empty
+        let unknown = handle_request(
+            r#"{"method":"get_file_activity","params":{"workspace_id":"00000000-0000-0000-0000-000000000000"}}"#,
+            &state_tx,
+        )
+        .await;
+        assert!(unknown.ok);
+        assert!(unknown.data.unwrap().as_array().unwrap().is_empty());
+
+        // Query with limit
+        let limited = handle_request(
+            r#"{"method":"get_file_activity","params":{"limit":0}}"#,
+            &state_tx,
+        )
+        .await;
+        assert!(limited.ok);
+        assert!(limited.data.unwrap().as_array().unwrap().is_empty());
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_request_get_agent_assignments_returns_fallback_names() {
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let ws = make_workspace("my-worktree");
+        let ws_id = ws.id;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state_tx
+            .send(StateMessage::RegisterWorkspace {
+                workspace: ws,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        // Query without agents.toml — should fall back to workspace name
+        let response = handle_request(
+            r#"{"method":"get_agent_assignments","params":{}}"#,
+            &state_tx,
+        )
+        .await;
+        assert!(response.ok, "expected ok, got error: {:?}", response.error);
+        let data = response.data.unwrap();
+        let arr = data.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["workspace_id"], serde_json::json!(ws_id.to_string()));
+        assert_eq!(arr[0]["agent_name"], "my-worktree");
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parse_get_agent_assignments_request() {
+        let request: SocketRequest =
+            serde_json::from_str(r#"{"method":"get_agent_assignments","params":{}}"#).unwrap();
+        let parsed = parse_request(&request).unwrap();
+        match parsed {
+            ParsedRequest::Query(QueryRequest::GetAgentAssignments) => {}
+            other => panic!("expected GetAgentAssignments, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

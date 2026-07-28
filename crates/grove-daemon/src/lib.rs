@@ -1,3 +1,4 @@
+pub mod agent_config;
 pub mod db;
 pub(crate) mod git;
 pub mod lifecycle;
@@ -104,6 +105,8 @@ async fn run_inner(
     info!(db_path = %paths.db_file.display(), "database opened");
 
     // Start state actor
+    let mut config = config.clone();
+    config.grove_dir = paths.pid_file.parent().map(Path::to_path_buf);
     let (state_tx, event_tx, state_handle) = state::spawn_state_actor(config.clone(), Some(db));
     info!("state actor started");
 
