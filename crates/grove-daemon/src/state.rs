@@ -1,5 +1,8 @@
+use chrono::Utc;
 use grove_lib::graph::{GraphOverlay, ImportGraph};
-use grove_lib::{CommitHash, OrthogonalityScore, Workspace, WorkspaceId, WorkspacePairAnalysis};
+use grove_lib::{
+    CommitHash, FileActivity, OrthogonalityScore, Workspace, WorkspaceId, WorkspacePairAnalysis,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -179,6 +182,7 @@ pub struct DaemonState {
     pair_analyses: HashMap<(WorkspaceId, WorkspaceId), WorkspacePairAnalysis>,
     dirty_workspaces: Vec<WorkspaceId>,
     in_flight_pairs: HashSet<(WorkspaceId, WorkspaceId)>,
+    file_activity: HashMap<WorkspaceId, HashMap<PathBuf, FileActivity>>,
     analysis_waiters: Vec<oneshot::Sender<QueryResponse>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
@@ -208,6 +212,7 @@ impl DaemonState {
             pair_analyses: HashMap::new(),
             dirty_workspaces: Vec::new(),
             in_flight_pairs: HashSet::new(),
+            file_activity: HashMap::new(),
             analysis_waiters: Vec::new(),
             event_tx,
             worker_tx: None,
@@ -428,6 +433,42 @@ impl DaemonState {
         }
 
         debug!(workspace_id = %workspace_id, path = %path.display(), "file changed");
+
+        // Track file activity: convert absolute watcher path to workspace-relative
+        if let Some(workspace) = self.workspaces.get(&workspace_id) {
+            match path.strip_prefix(&workspace.path) {
+                Ok(relative) if !relative.as_os_str().is_empty() => {
+                    let now = Utc::now();
+                    let relative = relative.to_path_buf();
+                    self.file_activity
+                        .entry(workspace_id)
+                        .or_default()
+                        .entry(relative.clone())
+                        .and_modify(|entry| {
+                            entry.last_changed_at = now;
+                            entry.change_count += 1;
+                        })
+                        .or_insert_with(|| FileActivity {
+                            workspace_id,
+                            relative_path: relative,
+                            first_changed_at: now,
+                            last_changed_at: now,
+                            change_count: 1,
+                        });
+                }
+                Ok(_) => {
+                    debug!(workspace_id = %workspace_id, "file change at worktree root, ignoring");
+                }
+                Err(_) => {
+                    debug!(
+                        workspace_id = %workspace_id,
+                        path = %path.display(),
+                        worktree = %workspace.path.display(),
+                        "file change outside worktree, ignoring"
+                    );
+                }
+            }
+        }
 
         if !self.dirty_workspaces.contains(&workspace_id) {
             self.dirty_workspaces.push(workspace_id);
@@ -710,6 +751,7 @@ impl DaemonState {
         info!(workspace_id = %workspace_id, "removing workspace");
 
         self.workspace_overlays.remove(&workspace_id);
+        self.file_activity.remove(&workspace_id);
         self.dirty_workspaces.retain(|id| *id != workspace_id);
 
         // Remove all pair analyses involving this workspace
@@ -2212,5 +2254,200 @@ mod tests {
 
         tx.send(StateMessage::Shutdown).await.unwrap();
         handle.await.unwrap();
+    }
+
+    // ── File activity tracking ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_activity_absolute_path_becomes_relative() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let ws_activity = state.file_activity.get(&ws_id).unwrap();
+        assert_eq!(ws_activity.len(), 1);
+        let entry = ws_activity.get(&PathBuf::from("src/lib.rs")).unwrap();
+        assert_eq!(entry.workspace_id, ws_id);
+        assert_eq!(entry.relative_path, PathBuf::from("src/lib.rs"));
+        assert_eq!(entry.change_count, 1);
+    }
+
+    #[tokio::test]
+    async fn file_activity_outside_worktree_is_rejected() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root);
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &PathBuf::from("/other/path/file.rs"))
+            .await;
+
+        assert!(state.file_activity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_activity_repeated_writes_update_one_record() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let path = root.join("src/lib.rs");
+        state.handle_file_changed(ws_id, &path).await;
+        state.handle_file_changed(ws_id, &path).await;
+
+        let ws_activity = state.file_activity.get(&ws_id).unwrap();
+        assert_eq!(ws_activity.len(), 1);
+        let entry = ws_activity.get(&PathBuf::from("src/lib.rs")).unwrap();
+        assert_eq!(entry.change_count, 2);
+    }
+
+    #[tokio::test]
+    async fn file_activity_timestamps_on_repeated_writes() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let path = root.join("src/lib.rs");
+        state.handle_file_changed(ws_id, &path).await;
+        let entry_after_first = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap()
+            .clone();
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        state.handle_file_changed(ws_id, &path).await;
+        let entry = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap();
+
+        assert_eq!(entry.first_changed_at, entry_after_first.first_changed_at);
+        assert!(
+            entry.last_changed_at > entry.first_changed_at,
+            "last_changed_at ({last}) should be later than first_changed_at ({first})",
+            last = entry.last_changed_at,
+            first = entry.first_changed_at,
+        );
+        assert_eq!(entry.change_count, 2);
+    }
+
+    #[tokio::test]
+    async fn file_activity_change_count_increments() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let path = root.join("src/lib.rs");
+        for _ in 0..5 {
+            state.handle_file_changed(ws_id, &path).await;
+        }
+
+        let entry = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap();
+        assert_eq!(entry.change_count, 5);
+    }
+
+    #[tokio::test]
+    async fn file_activity_identical_relative_paths_in_separate_worktrees() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root_a = PathBuf::from("/tmp/worktree-a");
+        let root_b = PathBuf::from("/tmp/worktree-b");
+        let ws_a = make_workspace_at_path("a", "main", root_a.clone());
+        let ws_b = make_workspace_at_path("b", "main", root_b.clone());
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+        state.handle_register_workspace(ws_a).unwrap();
+        state.handle_register_workspace(ws_b).unwrap();
+
+        state
+            .handle_file_changed(id_a, &root_a.join("src/lib.rs"))
+            .await;
+        state
+            .handle_file_changed(id_b, &root_b.join("src/lib.rs"))
+            .await;
+
+        let a_activity = state.file_activity.get(&id_a).unwrap();
+        let b_activity = state.file_activity.get(&id_b).unwrap();
+        assert_eq!(a_activity.len(), 1);
+        assert_eq!(b_activity.len(), 1);
+        // Both have the same relative path but under different workspace IDs
+        assert_eq!(
+            a_activity
+                .get(&PathBuf::from("src/lib.rs"))
+                .unwrap()
+                .workspace_id,
+            id_a
+        );
+        assert_eq!(
+            b_activity
+                .get(&PathBuf::from("src/lib.rs"))
+                .unwrap()
+                .workspace_id,
+            id_b
+        );
+    }
+
+    #[tokio::test]
+    async fn file_activity_unknown_workspace_rejected() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state
+            .handle_file_changed(Uuid::new_v4(), &PathBuf::from("/some/path/file.rs"))
+            .await;
+        assert!(state.file_activity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_activity_worktree_root_not_stored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        // Send the worktree root itself as the changed path
+        state.handle_file_changed(ws_id, &root).await;
+
+        assert!(state.file_activity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_activity_removing_workspace_clears_activity() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+        assert!(state.file_activity.contains_key(&ws_id));
+
+        state.handle_remove_workspace(ws_id).unwrap();
+        assert!(!state.file_activity.contains_key(&ws_id));
     }
 }

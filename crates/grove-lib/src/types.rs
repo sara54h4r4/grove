@@ -30,6 +30,17 @@ pub struct WorkspaceMetadata {
     pub pr_url: Option<String>,
 }
 
+// === File Activity ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileActivity {
+    pub workspace_id: WorkspaceId,
+    pub relative_path: PathBuf,
+    pub first_changed_at: DateTime<Utc>,
+    pub last_changed_at: DateTime<Utc>,
+    pub change_count: u64,
+}
+
 // === Change Analysis ===
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
