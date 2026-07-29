@@ -148,6 +148,49 @@ fn parse_request(request: &SocketRequest) -> Result<ParsedRequest, String> {
             }))
         }
         "get_agent_assignments" => Ok(ParsedRequest::Query(QueryRequest::GetAgentAssignments)),
+        "get_agent_sessions" => {
+            let provider = match request.params.get("provider") {
+                Some(value) => {
+                    let s = value
+                        .as_str()
+                        .ok_or_else(|| "invalid provider: expected string".to_string())?;
+                    Some(
+                        s.parse::<grove_lib::AgentProvider>()
+                            .map_err(|e| format!("invalid provider: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+            let workspace_id = match request.params.get("workspace_id") {
+                Some(value) => {
+                    let s = value
+                        .as_str()
+                        .ok_or_else(|| "invalid workspace_id: expected string".to_string())?;
+                    Some(
+                        s.parse::<WorkspaceId>()
+                            .map_err(|e| format!("invalid workspace_id: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+            let lifecycle = match request.params.get("lifecycle") {
+                Some(value) => {
+                    let s = value
+                        .as_str()
+                        .ok_or_else(|| "invalid lifecycle: expected string".to_string())?;
+                    Some(
+                        s.parse::<grove_lib::SessionLifecycle>()
+                            .map_err(|e| format!("invalid lifecycle: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+            Ok(ParsedRequest::Query(QueryRequest::GetAgentSessions {
+                provider,
+                workspace_id,
+                lifecycle,
+            }))
+        }
         "get_file_activity" => {
             let workspace_id = match request.params.get("workspace_id") {
                 Some(value) => {
@@ -274,6 +317,10 @@ fn query_response_to_socket(response: QueryResponse) -> SocketResponse {
             Err(e) => SocketResponse::error(format!("serialization error: {e}")),
         },
         QueryResponse::AgentAssignments(assignments) => match serde_json::to_value(&assignments) {
+            Ok(data) => SocketResponse::success(data),
+            Err(e) => SocketResponse::error(format!("serialization error: {e}")),
+        },
+        QueryResponse::AgentSessions(sessions) => match serde_json::to_value(&sessions) {
             Ok(data) => SocketResponse::success(data),
             Err(e) => SocketResponse::error(format!("serialization error: {e}")),
         },
@@ -830,7 +877,8 @@ async fn handle_request_with_options(
             | QueryRequest::GetAllAnalyses
             | QueryRequest::GetStatus
             | QueryRequest::GetFileActivity { .. }
-            | QueryRequest::GetAgentAssignments => {
+            | QueryRequest::GetAgentAssignments
+            | QueryRequest::GetAgentSessions { .. } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let message = StateMessage::Query {
                     request: query,
@@ -963,6 +1011,7 @@ async fn await_analysis_timeout_response(
         | Ok(Ok(QueryResponse::Status { .. }))
         | Ok(Ok(QueryResponse::FileActivity(_)))
         | Ok(Ok(QueryResponse::AgentAssignments(_)))
+        | Ok(Ok(QueryResponse::AgentSessions(_)))
         | Ok(Err(_))
         | Err(_) => fallback,
     }
@@ -971,11 +1020,13 @@ async fn await_analysis_timeout_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_registry::SessionUpdate;
     use crate::state::{GroveConfig, spawn_state_actor};
     use crate::worker::WorkerMessage;
     use chrono::Utc;
     use grove_lib::{
-        MergeOrder, OrthogonalityScore, Workspace, WorkspaceMetadata, WorkspacePairAnalysis,
+        DiscoverySource, MergeOrder, OrthogonalityScore, Workspace, WorkspaceMetadata,
+        WorkspacePairAnalysis,
     };
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -2628,6 +2679,9 @@ mod tests {
         assert_eq!(arr[0]["workspace_id"], serde_json::json!(ws_id.to_string()));
         assert_eq!(arr[0]["relative_path"], "src/lib.rs");
         assert_eq!(arr[0]["change_count"], 1);
+        assert_eq!(arr[0]["attribution"]["confidence"], "Unknown");
+        assert_eq!(arr[0]["attribution"]["sessions"], serde_json::json!([]));
+        assert!(arr[0]["attribution"]["static_agent_name"].is_null());
 
         // Query with workspace_id filter
         let filtered = handle_request(
@@ -2756,5 +2810,292 @@ mod tests {
         };
         let second_text = std::str::from_utf8(trim_line_ending(&second_line)).unwrap();
         assert_eq!(second_text, r#"{"method":"status","params":{}}"#);
+    }
+
+    // === get_agent_sessions: parsing tests ===
+
+    #[test]
+    fn parse_get_agent_sessions_no_filters() {
+        let request: SocketRequest =
+            serde_json::from_str(r#"{"method":"get_agent_sessions","params":{}}"#).unwrap();
+        let parsed = parse_request(&request).unwrap();
+        match parsed {
+            ParsedRequest::Query(QueryRequest::GetAgentSessions {
+                provider: None,
+                workspace_id: None,
+                lifecycle: None,
+            }) => {}
+            other => panic!("expected GetAgentSessions with no filters, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_get_agent_sessions_all_filters() {
+        let request: SocketRequest = serde_json::from_str(
+            r#"{"method":"get_agent_sessions","params":{"provider":"opencode","workspace_id":"00000000-0000-0000-0000-000000000000","lifecycle":"active"}}"#,
+        )
+        .unwrap();
+        let parsed = parse_request(&request).unwrap();
+        match parsed {
+            ParsedRequest::Query(QueryRequest::GetAgentSessions {
+                provider: Some(p),
+                workspace_id: Some(wid),
+                lifecycle: Some(lc),
+            }) => {
+                assert_eq!(p, grove_lib::AgentProvider::OpenCode);
+                assert_eq!(
+                    wid,
+                    "00000000-0000-0000-0000-000000000000"
+                        .parse::<WorkspaceId>()
+                        .unwrap()
+                );
+                assert_eq!(lc, grove_lib::SessionLifecycle::Active);
+            }
+            other => panic!("expected GetAgentSessions with all filters, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_get_agent_sessions_invalid_provider_returns_error() {
+        let request: SocketRequest =
+            serde_json::from_str(r#"{"method":"get_agent_sessions","params":{"provider":"nope"}}"#)
+                .unwrap();
+        let result = parse_request(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid provider"));
+    }
+
+    #[test]
+    fn parse_get_agent_sessions_invalid_lifecycle_returns_error() {
+        let request: SocketRequest = serde_json::from_str(
+            r#"{"method":"get_agent_sessions","params":{"lifecycle":"bogus"}}"#,
+        )
+        .unwrap();
+        let result = parse_request(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid lifecycle"));
+    }
+
+    #[test]
+    fn parse_get_agent_sessions_provider_wrong_type_returns_error() {
+        let request: SocketRequest =
+            serde_json::from_str(r#"{"method":"get_agent_sessions","params":{"provider":42}}"#)
+                .unwrap();
+        let result = parse_request(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected string"));
+    }
+
+    // === get_agent_sessions: round-trip tests ===
+
+    #[tokio::test]
+    async fn round_trip_get_agent_sessions_empty_registry() {
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let response =
+            handle_request(r#"{"method":"get_agent_sessions","params":{}}"#, &state_tx).await;
+        assert!(response.ok, "expected ok, got error: {:?}", response.error);
+        let data = response.data.unwrap();
+        let arr = data.as_array().unwrap();
+        assert!(arr.is_empty(), "expected empty array for empty registry");
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trip_get_agent_sessions_provider_filter() {
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        // Insert sessions for two providers
+        state_tx
+            .send(StateMessage::AgentSessionUpdates {
+                updates: vec![
+                    SessionUpdate {
+                        provider: grove_lib::AgentProvider::OpenCode,
+                        native_session_id: "oc-1".to_string(),
+                        parent_native_session_id: None,
+                        agent_role: None,
+                        directory: PathBuf::from("/tmp/ws-a"),
+                        lifecycle: grove_lib::SessionLifecycle::Active,
+                        discovery_source: DiscoverySource::ProcessScan,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                    SessionUpdate {
+                        provider: grove_lib::AgentProvider::ClaudeCode,
+                        native_session_id: "cc-1".to_string(),
+                        parent_native_session_id: None,
+                        agent_role: None,
+                        directory: PathBuf::from("/tmp/ws-b"),
+                        lifecycle: grove_lib::SessionLifecycle::Idle,
+                        discovery_source: DiscoverySource::ApiPoll,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Filter by OpenCode only
+        let response = handle_request(
+            r#"{"method":"get_agent_sessions","params":{"provider":"opencode"}}"#,
+            &state_tx,
+        )
+        .await;
+        assert!(response.ok);
+        let arr = response.data.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["provider"], "OpenCode");
+        assert_eq!(arr[0]["native_session_id"], "oc-1");
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trip_get_agent_sessions_lifecycle_filter() {
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        state_tx
+            .send(StateMessage::AgentSessionUpdates {
+                updates: vec![
+                    SessionUpdate {
+                        provider: grove_lib::AgentProvider::OpenCode,
+                        native_session_id: "oc-1".to_string(),
+                        parent_native_session_id: None,
+                        agent_role: None,
+                        directory: PathBuf::from("/tmp/ws-a"),
+                        lifecycle: grove_lib::SessionLifecycle::Active,
+                        discovery_source: DiscoverySource::ProcessScan,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                    SessionUpdate {
+                        provider: grove_lib::AgentProvider::OpenCode,
+                        native_session_id: "oc-2".to_string(),
+                        parent_native_session_id: None,
+                        agent_role: None,
+                        directory: PathBuf::from("/tmp/ws-b"),
+                        lifecycle: grove_lib::SessionLifecycle::Stopped,
+                        discovery_source: DiscoverySource::EventStream,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Filter by Active lifecycle
+        let response = handle_request(
+            r#"{"method":"get_agent_sessions","params":{"lifecycle":"active"}}"#,
+            &state_tx,
+        )
+        .await;
+        assert!(response.ok);
+        let arr = response.data.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected 1 active session");
+        assert_eq!(arr[0]["native_session_id"], "oc-1");
+        assert_eq!(arr[0]["lifecycle"], "Active");
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trip_get_agent_sessions_newest_first_ordering() {
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        // Insert two sessions — second will have a newer updated_at
+        state_tx
+            .send(StateMessage::AgentSessionUpdates {
+                updates: vec![SessionUpdate {
+                    provider: grove_lib::AgentProvider::OpenCode,
+                    native_session_id: "older".to_string(),
+                    parent_native_session_id: None,
+                    agent_role: None,
+                    directory: PathBuf::from("/tmp/ws-a"),
+                    lifecycle: grove_lib::SessionLifecycle::Active,
+                    discovery_source: DiscoverySource::ProcessScan,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        state_tx
+            .send(StateMessage::AgentSessionUpdates {
+                updates: vec![SessionUpdate {
+                    provider: grove_lib::AgentProvider::ClaudeCode,
+                    native_session_id: "newer".to_string(),
+                    parent_native_session_id: None,
+                    agent_role: None,
+                    directory: PathBuf::from("/tmp/ws-b"),
+                    lifecycle: grove_lib::SessionLifecycle::Active,
+                    discovery_source: DiscoverySource::ApiPoll,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response =
+            handle_request(r#"{"method":"get_agent_sessions","params":{}}"#, &state_tx).await;
+        assert!(response.ok);
+        let arr = response.data.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // newest first: "newer" was inserted after "older"
+        assert_eq!(arr[0]["native_session_id"], "newer");
+        assert_eq!(arr[1]["native_session_id"], "older");
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_response_agent_sessions_serializes_correctly() {
+        use grove_lib::AgentSession;
+        use uuid::Uuid;
+
+        let sessions = vec![AgentSession {
+            provider: grove_lib::AgentProvider::OpenCode,
+            native_session_id: "ses-1".to_string(),
+            parent_native_session_id: None,
+            agent_role: Some("coder".to_string()),
+            directory: PathBuf::from("/tmp/project"),
+            workspace_id: Some(Uuid::nil()),
+            lifecycle: grove_lib::SessionLifecycle::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            first_seen_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            discovery_source: DiscoverySource::ProcessScan,
+            compacted: false,
+        }];
+
+        let socket_response = query_response_to_socket(QueryResponse::AgentSessions(sessions));
+        assert!(socket_response.ok);
+        let data = socket_response.data.unwrap();
+        let arr = data.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["provider"], "OpenCode");
+        assert_eq!(arr[0]["native_session_id"], "ses-1");
+        assert_eq!(arr[0]["lifecycle"], "Active");
+        assert_eq!(arr[0]["agent_role"], "coder");
+        // Ensure credentials are never exposed
+        assert!(arr[0].get("username").is_none());
+        assert!(arr[0].get("password").is_none());
+        assert!(arr[0].get("api_key").is_none());
+        assert!(arr[0].get("server_url").is_none());
     }
 }

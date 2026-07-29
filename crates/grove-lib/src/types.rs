@@ -32,6 +32,38 @@ pub struct WorkspaceMetadata {
 
 // === File Activity ===
 
+/// How confidently Grove can associate a file change with an agent session.
+///
+/// `Exact` is reserved for a provider signal that directly identifies both the
+/// session and file. Filesystem timing correlation alone never produces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttributionConfidence {
+    Exact,
+    Strong,
+    Ambiguous,
+    StaticFallback,
+    Unknown,
+}
+
+/// Provider-qualified session identity attached to a file attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionRef {
+    pub provider: AgentProvider,
+    pub native_session_id: String,
+}
+
+/// Latest agent attribution for a file-activity record.
+///
+/// This contains identity and confidence metadata only. Grove never stores
+/// prompts, responses, reasoning, tool payloads, or file contents here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAttribution {
+    pub confidence: AttributionConfidence,
+    pub sessions: Vec<AgentSessionRef>,
+    pub static_agent_name: Option<String>,
+    pub attributed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileActivity {
     pub workspace_id: WorkspaceId,
@@ -39,6 +71,7 @@ pub struct FileActivity {
     pub first_changed_at: DateTime<Utc>,
     pub last_changed_at: DateTime<Utc>,
     pub change_count: u64,
+    pub attribution: FileAttribution,
 }
 
 // === Agent Assignment ===
@@ -266,6 +299,85 @@ pub enum MergeOrder {
     BFirst,
     Either,
     NeedsCoordination,
+}
+
+// === Agent Session Types ===
+
+/// Supported coding-agent providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentProvider {
+    OpenCode,
+    ClaudeCode,
+    Codex,
+    Unknown,
+}
+
+/// Lifecycle state of a discovered agent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionLifecycle {
+    Discovered,
+    Active,
+    Idle,
+    Stopped,
+    Stale,
+}
+
+impl std::str::FromStr for AgentProvider {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "opencode" => Ok(Self::OpenCode),
+            "claude" | "claude_code" => Ok(Self::ClaudeCode),
+            "codex" => Ok(Self::Codex),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(format!("unknown agent provider: {s}")),
+        }
+    }
+}
+
+impl std::str::FromStr for SessionLifecycle {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "discovered" => Ok(Self::Discovered),
+            "active" => Ok(Self::Active),
+            "idle" => Ok(Self::Idle),
+            "stopped" => Ok(Self::Stopped),
+            "stale" => Ok(Self::Stale),
+            _ => Err(format!("unknown session lifecycle: {s}")),
+        }
+    }
+}
+
+/// How a session was discovered by Grove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscoverySource {
+    ApiPoll,
+    EventStream,
+    ProcessScan,
+    StaticConfig,
+    Manual,
+}
+
+/// Provider-neutral representation of an agent session.
+///
+/// Stores only allowlisted metadata. Content fields such as prompts,
+/// responses, conversation titles, and file contents are excluded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSession {
+    pub provider: AgentProvider,
+    pub native_session_id: String,
+    pub parent_native_session_id: Option<String>,
+    pub agent_role: Option<String>,
+    pub directory: PathBuf,
+    pub workspace_id: Option<WorkspaceId>,
+    pub lifecycle: SessionLifecycle,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub discovery_source: DiscoverySource,
+    pub compacted: bool,
 }
 
 #[cfg(test)]

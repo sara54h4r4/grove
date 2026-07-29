@@ -1,7 +1,10 @@
 pub mod agent_config;
 pub mod db;
+pub mod event_stream;
 pub(crate) mod git;
 pub mod lifecycle;
+pub mod opencode;
+pub mod session_registry;
 pub mod socket;
 pub mod state;
 pub mod watcher;
@@ -147,6 +150,41 @@ async fn run_inner(
         repo_git_dir,
     ));
 
+    // Start OpenCode polling if configured
+    let mut opencode_poller = config.opencode.as_ref().map(|oc_cfg| {
+        let client = crate::opencode::OpenCodeClient::new(
+            &oc_cfg.server_url,
+            &oc_cfg.username,
+            &oc_cfg.password,
+        );
+        crate::opencode::spawn_opencode_poller(
+            client,
+            state_tx.clone(),
+            crate::opencode::OPENCODE_POLL_INTERVAL,
+        )
+    });
+
+    // Start OpenCode's live event stream if configured. The stream supervisor
+    // fetches an allowlisted recovery snapshot before every (re)connection.
+    let mut opencode_event_stream = config.opencode.as_ref().map(|oc_cfg| {
+        let snapshot_client = crate::opencode::OpenCodeClient::new(
+            &oc_cfg.server_url,
+            &oc_cfg.username,
+            &oc_cfg.password,
+        );
+        let event_client = crate::event_stream::EventStreamClient::new(
+            &oc_cfg.server_url,
+            &oc_cfg.username,
+            &oc_cfg.password,
+        );
+        crate::opencode::spawn_opencode_event_stream(
+            snapshot_client,
+            event_client,
+            state_tx.clone(),
+            crate::opencode::ReconnectPolicy::default(),
+        )
+    });
+
     // Create and run socket server
     let server = SocketServer::new(&paths.socket_file, state_tx.clone(), event_tx.clone())
         .with_timeouts(
@@ -191,6 +229,24 @@ async fn run_inner(
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!(error = %e, "watcher loop exited with error"),
         Err(e) => warn!(error = %e, "watcher loop task panicked"),
+    }
+
+    // Stop OpenCode live events before shutting down the state actor.
+    if let Some((shutdown_tx, handle)) = opencode_event_stream.take() {
+        let _ = shutdown_tx.send(());
+        if let Err(e) = handle.await {
+            warn!(error = %e, "opencode event-stream task panicked");
+        }
+        info!("opencode event stream stopped");
+    }
+
+    // Stop OpenCode poller if it was started
+    if let Some((shutdown_tx, handle)) = opencode_poller.take() {
+        let _ = shutdown_tx.send(());
+        if let Err(e) = handle.await {
+            warn!(error = %e, "opencode poller task panicked");
+        }
+        info!("opencode poller stopped");
     }
 
     // Graceful shutdown: tell the state actor to drain and stop

@@ -48,30 +48,55 @@ pub fn resolve_assignments(
         .collect()
 }
 
+/// Resolve only an explicit `agents.toml` assignment.
+///
+/// Unlike [`resolve_assignments`], this does not synthesize a workspace-name
+/// fallback. Callers can therefore distinguish configured attribution from an
+/// unknown agent.
+pub(crate) fn resolve_explicit_assignment(
+    config: &Option<AgentsConfig>,
+    workspace: &Workspace,
+) -> Option<String> {
+    config
+        .as_ref()
+        .and_then(|config| find_matching_agent(config, workspace))
+}
+
 fn find_matching_agent(config: &AgentsConfig, ws: &Workspace) -> Option<String> {
-    for entry in &config.agents {
-        if let Some(ref path_str) = entry.path
-            && Path::new(path_str) == ws.path
-        {
-            return Some(entry.name.clone());
-        }
-        if let Some(ref branch) = entry.branch
-            && branch == &ws.branch
-        {
-            return Some(entry.name.clone());
-        }
-        if let Some(ref pattern) = entry.branch_pattern
-            && wildcard_match(pattern, &ws.branch)
-        {
-            return Some(entry.name.clone());
-        }
-        if let Some(ref pattern) = entry.worktree_pattern
-            && wildcard_match(pattern, &ws.name)
-        {
-            return Some(entry.name.clone());
-        }
-    }
-    None
+    config
+        .agents
+        .iter()
+        .find(|entry| {
+            entry
+                .path
+                .as_deref()
+                .is_some_and(|path| Path::new(path) == ws.path)
+        })
+        .or_else(|| {
+            config.agents.iter().find(|entry| {
+                entry
+                    .branch
+                    .as_deref()
+                    .is_some_and(|branch| branch == ws.branch)
+            })
+        })
+        .or_else(|| {
+            config.agents.iter().find(|entry| {
+                entry
+                    .branch_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| wildcard_match(pattern, &ws.branch))
+            })
+        })
+        .or_else(|| {
+            config.agents.iter().find(|entry| {
+                entry
+                    .worktree_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| wildcard_match(pattern, &ws.name))
+            })
+        })
+        .map(|entry| entry.name.clone())
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -155,8 +180,32 @@ mod tests {
                 worktree_pattern: None,
             },
         ]);
-        let result = resolve_assignments(&config, &[ws.clone()]);
+        let result = resolve_assignments(&config, std::slice::from_ref(&ws));
         assert_eq!(result[0].agent_name, "PathAgent");
+    }
+
+    #[test]
+    fn exact_path_precedence_is_independent_of_entry_order() {
+        let ws = make_workspace(Uuid::new_v4(), "my-ws", "main", "/home/user/repo");
+        let config = make_config(vec![
+            AgentEntry {
+                name: "EarlierBranchAgent".into(),
+                path: None,
+                branch: Some("main".into()),
+                branch_pattern: None,
+                worktree_pattern: None,
+            },
+            AgentEntry {
+                name: "LaterPathAgent".into(),
+                path: Some("/home/user/repo".into()),
+                branch: None,
+                branch_pattern: None,
+                worktree_pattern: None,
+            },
+        ]);
+
+        let result = resolve_assignments(&config, std::slice::from_ref(&ws));
+        assert_eq!(result[0].agent_name, "LaterPathAgent");
     }
 
     #[test]
@@ -178,7 +227,7 @@ mod tests {
                 worktree_pattern: None,
             },
         ]);
-        let result = resolve_assignments(&config, &[ws.clone()]);
+        let result = resolve_assignments(&config, std::slice::from_ref(&ws));
         assert_eq!(result[0].agent_name, "BranchAgent");
     }
 
@@ -192,7 +241,7 @@ mod tests {
             branch_pattern: Some("feature/codex-*".into()),
             worktree_pattern: None,
         }]);
-        let result = resolve_assignments(&config, &[ws.clone()]);
+        let result = resolve_assignments(&config, std::slice::from_ref(&ws));
         assert_eq!(result[0].agent_name, "Codex");
     }
 
@@ -211,14 +260,14 @@ mod tests {
             branch_pattern: None,
             worktree_pattern: Some("*claude*".into()),
         }]);
-        let result = resolve_assignments(&config, &[ws.clone()]);
+        let result = resolve_assignments(&config, std::slice::from_ref(&ws));
         assert_eq!(result[0].agent_name, "Claude");
     }
 
     #[test]
     fn fallback_to_workspace_name() {
         let ws = make_workspace(Uuid::new_v4(), "unnamed-worktree", "some-branch", "/tmp/ws");
-        let result = resolve_assignments(&None, &[ws.clone()]);
+        let result = resolve_assignments(&None, std::slice::from_ref(&ws));
         assert_eq!(result[0].agent_name, "unnamed-worktree");
     }
 
@@ -241,7 +290,7 @@ mod tests {
                 worktree_pattern: None,
             },
         ]);
-        let result = resolve_assignments(&config, &[ws.clone()]);
+        let result = resolve_assignments(&config, std::slice::from_ref(&ws));
         assert_eq!(result[0].agent_name, "First");
     }
 

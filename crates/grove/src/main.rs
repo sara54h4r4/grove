@@ -68,7 +68,17 @@ fn main() {
             }
         };
 
-        let config = grove_daemon::state::GroveConfig::default();
+        let mut config = grove_daemon::state::GroveConfig::default();
+        match grove_daemon::state::OpenCodeConfig::from_env() {
+            Ok(Some(oc_config)) => {
+                config.opencode = Some(oc_config);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         if let Err(e) = rt.block_on(grove_daemon::run(config, &grove_dir)) {
             eprintln!("daemon error: {e}");
             std::process::exit(1);
