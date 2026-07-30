@@ -2,14 +2,14 @@
 
 Date: 2026-07-29
 
-Status: Awaiting written-spec review
+Status: Awaiting written-spec re-review after required revisions
 
 ## Summary
 
 Grove will integrate Codex through two official, complementary surfaces:
 
-1. A read-only Codex App Server client for safe session metadata snapshots and
-   recovery.
+1. A Grove client that invokes only the allowlisted read-only subset of Codex
+   App Server for safe session metadata snapshots and recovery.
 2. An opt-in Codex lifecycle-hook bridge for live session and subagent
    lifecycle events.
 
@@ -78,28 +78,41 @@ Official references:
 - Claiming exact file attribution. The initial Codex adapter declares exact
   file activity unsupported.
 - Solving global, cross-repository daemon discovery in this stage. The hook
-  bridge initially publishes to the nearest active Grove workspace.
+  bridge uses the nearest `.grove` only to locate a transport; the daemon, not
+  the bridge, decides workspace ownership from the reported directory.
 
 ## Architecture
 
-### Provider-neutral lifecycle event
+### Provider-neutral observation
 
 Move the normalized lifecycle event out of the OpenCode SSE module into a
-provider-neutral shared boundary. The event contains only:
+provider-neutral shared boundary. Its safe field contract is:
 
-- provider;
-- native session ID;
-- optional parent native session ID;
-- optional bounded agent role;
-- optional working directory;
-- normalized lifecycle event kind;
-- optional lifecycle value;
-- optional timestamp;
-- compacted boolean.
+```text
+provider
+adapter_instance_id
+native_session_id
+native_parent_session_id?
+native_agent_id?
+event_kind
+lifecycle?
+directory?
+role?
+event_time?
+observed_time
+source
+source_confidence
+compacted
+```
+
+All identifiers, directory and role values are bounded and validated.
+`source` is one of `LifecycleHook`, `ProviderEventStream`,
+`ProviderSnapshot`, or `ProviderRuntimeStatus`.
+`source_confidence` is one of `LiveAuthoritative`,
+`MetadataAuthoritative`, `PresenceHint`, or `StaticFallback`.
 
 Provider-neutral event kinds are:
 
-- `ProviderConnected`;
 - `SessionCreated`;
 - `SessionUpdated`;
 - `SessionCompacted`;
@@ -107,8 +120,86 @@ Provider-neutral event kinds are:
 - `ActivityUpdated`.
 
 OpenCode continues to normalize its existing SSE events into this type. Codex
-hook events normalize into the same type. Provider-specific wire event names do
-not enter `DaemonState`.
+hook and App Server observations normalize into the same type.
+Provider-specific wire event names do not enter `DaemonState`. OpenCode's
+`server.connected` event, process presence, and static configuration remain
+provider-health/display inputs outside this session-scoped type, so Grove never
+invents a native session ID for them.
+
+`event_time` is used for ordering only between observations from the same
+source when that source supplies it. `observed_time` is assigned monotonically
+by the trusted daemon/adapter ingress and is the fallback ordering key; a value
+supplied by a hook caller is ignored. A newer low-authority observation cannot
+override a higher-authority lifecycle merely because it was observed later.
+
+### Identity and runtime namespace
+
+A Grove session key is:
+
+```text
+(provider, adapter_instance_id, native_session_id, native_agent_id?)
+```
+
+For a root thread, `native_session_id` is the Codex session/thread ID and
+`native_agent_id` is absent. For a hook-reported child,
+`native_session_id` is the owning parent session ID and `native_agent_id` is
+the hook `agent_id`. The optional `native_parent_session_id` records hierarchy
+and, for nested children, is the immediate parent when Codex supplies it. This
+scopes an agent ID to its parent and prevents collisions even if Codex reuses
+agent IDs between roots.
+
+`adapter_instance_id` is an opaque stable UUID issued and persisted by Grove
+for one configured Codex ingress/App Server pairing. It namespaces simultaneous
+desktop, CLI, Windows, WSL, or explicitly configured App Server instances. It
+is not derived from a path, credential, process ID, or provider payload.
+Single-instance installations use the configured default. Once more than one
+Codex instance exists, each hook entry must name its public Grove instance
+alias; ambiguous unqualified hook events are discarded successfully.
+
+If a future allowlisted protocol field supplies a stable runtime identifier,
+Grove may retain it as optional adapter-health metadata, but it is not part of
+session identity. The currently verified Codex schemas do not establish such a
+field, so Grove must not manufacture one from process inspection. Multiple
+Codex processes that intentionally share one adapter alias therefore share one
+namespace and are not presented as individually attributable runtimes.
+
+App Server subagent records are reconciled with hook children only after the
+controlled compatibility gate verifies, using aggregate comparisons, that the
+App Server child thread ID equals the hook `agent_id` and that its
+`parentThreadId` equals the owning hook session ID. Once verified, the child
+uses `native_session_id=parentThreadId` and
+`native_agent_id=child_thread_id`. Until then, App Server child rows are
+excluded from session creation and contribute only aggregate compatibility
+counts; hook children still use the collision-safe key above. Ambiguity fails
+closed and Grove never guesses an identity join.
+
+### Observation authority and precedence
+
+Sources have narrow, non-interchangeable authority:
+
+| Input | Confidence | Authority |
+| --- | --- | --- |
+| `LifecycleHook` | `LiveAuthoritative` | live lifecycle for the named root or child |
+| `ProviderSnapshot` | `MetadataAuthoritative` | existence, safe metadata, hierarchy, and recovery |
+| `ProviderRuntimeStatus` | `LiveAuthoritative` only after its compatibility gate passes | live lifecycle for the verified visible runtime |
+| process presence (provider health only) | `PresenceHint` | provider availability only; never a distinct session or lifecycle |
+| static configuration (display input only) | `StaticFallback` | display label only |
+
+Within one session key, Grove applies these rules:
+
+1. An explicit hook lifecycle event is authoritative for live state.
+2. Verified App Server runtime status may supply live state when no newer hook
+   lifecycle exists, or after that hook state has become stale. Unverified or
+   cross-client-ambiguous status is metadata only.
+3. An App Server snapshot may create `Discovered` records and update approved
+   metadata, but cannot downgrade or stop a hook-derived lifecycle.
+4. Process presence and static configuration never create sessions or change
+   lifecycle.
+5. A later complete start hook may reopen a previously stopped session.
+
+A missing snapshot, adapter disconnect, transport error, or elapsed timeout is
+never evidence of `Stopped`. Only an explicit reliable stop event may produce
+`Stopped`.
 
 ### Codex adapter
 
@@ -116,18 +207,53 @@ not enter `DaemonState`.
 
 - an optional App Server snapshot client;
 - a provider-event broadcast subscription for hook events;
-- static or negotiated capability metadata.
+- its Grove-issued adapter instance ID;
+- tri-state negotiated capability metadata.
 
 Daemon startup performs one bounded asynchronous App Server capability
 negotiation before spawning provider tasks. Negotiation either produces a
 ready, state-database-only snapshot client or leaves the adapter in hook-only
-mode. Capabilities are fixed for that adapter instance after negotiation, so
-the generic task runner can decide which loops to start without races.
+mode. Capabilities are fixed for that adapter instance until the App Server is
+restarted and renegotiated, so the generic task runner can decide which loops
+to start without races.
+
+Each negotiated capability is `Supported`, `Unsupported`, or `Unknown`:
+
+- `supports_thread_loaded_list`;
+- `supports_parent_thread_id`;
+- `supports_agent_role`;
+- `supports_runtime_status`;
+- `supports_state_db_only`;
+- `supports_no_rollout_scan`;
+- `supports_subagent_hooks`;
+- `supports_explicit_stop_event`;
+- `supports_cross_client_visibility`;
+- `supports_cross_client_runtime_status`;
+- `supports_hook_snapshot_agent_join`.
+
+Negotiation uses only allowlisted request probes and sparse response
+validation. A version string alone cannot enable a capability. An absent
+optional field remains `Unknown` unless an allowlisted probe establishes
+support. Unknown values fail closed and are never treated as supported. A
+malformed required field rejects the whole snapshot page without mutating
+existing state. An unknown protocol major, or an unknown discriminant that
+affects identity, source authority, or lifecycle, disables that observation
+path even if unrelated sparse fields can be parsed.
+
+App Server protocol probes determine the listing, metadata, runtime-status, and
+state-database flags. The adapter's sparse hook schema determines whether Grove
+can parse subagent and explicit-stop event kinds, while hook installation
+availability is separately `Unknown`, `Configured`, or `Observed`; Grove never
+infers installation by inspecting global Codex configuration. Receipt of a
+valid allowlisted hook can advance availability to `Observed`, but absence of
+an event proves nothing.
 
 Capabilities:
 
 - snapshots: `FullMetadata` only when the App Server supports safe
-  state-database-only listing; otherwise `Unsupported`;
+  state-database-only listing, the controlled audit verifies no rollout scan,
+  and the compatibility gate has not found a conflicting state-store contract;
+  otherwise `Unsupported`;
 - events: a new `LifecycleHookPush` capability;
 - health: a new `ConnectionAndProviderReported` capability combining
   App Server connection state with provider-reported hook activity;
@@ -139,6 +265,11 @@ capabilities instead of starting unusable loops. An event listener whose
 snapshot capability is unsupported connects without attempting recovery
 snapshots. OpenCode behavior remains unchanged.
 
+Capabilities established only by the controlled compatibility procedure are
+stored against the exact adapter instance and Codex protocol/build tuple.
+Changing the executable or protocol/build tuple, or losing a previously
+compatible state-store outcome, resets those values to `Unknown`.
+
 ### App Server snapshot client
 
 The client launches a persistent `codex app-server` subprocess over stdio. The
@@ -149,7 +280,8 @@ The child:
 
 - is initialized once using an integration-specific client name;
 - opts into experimental fields needed for parent relationships;
-- receives only read-only `thread/list` requests;
+- receives only the allowlisted read-only `thread/list` and, when negotiated,
+  `thread/loaded/list` requests plus initialization and capability probes;
 - is never asked to read turns or items;
 - is never asked to start, resume, fork, or mutate a thread;
 - has stderr discarded rather than captured or logged;
@@ -171,56 +303,137 @@ If `useStateDbOnly` is rejected or unavailable, the snapshot capability is
 disabled for that runtime. Grove does not retry with scan-and-repair behavior,
 because that could cause the App Server to inspect rollout JSONL.
 
+Each accepted thread row first produces a `ProviderSnapshot` metadata
+observation. Its runtime-status field produces a separate
+`ProviderRuntimeStatus` lifecycle observation only when the relevant
+cross-client status capability is supported. This prevents a metadata snapshot
+from inheriting live authority as a whole.
+
 Snapshot lifecycle mapping:
 
-| App Server status | Grove lifecycle |
-| --- | --- |
-| `active` | `Active` |
-| `idle` | `Idle` |
-| `systemError` | `Stale` |
-| `notLoaded` | `Discovered` |
-| unknown future value | `Discovered` |
+| App Server status | Without verified live-status scope | With verified live-status scope |
+| --- | --- | --- |
+| `active` | preserve current lifecycle, or `Discovered` on creation | `Active` |
+| `idle` | preserve current lifecycle, or `Discovered` on creation | `Idle` |
+| `systemError` | preserve current lifecycle, or `Discovered` on creation | `Stale` |
+| `notLoaded` | preserve current lifecycle, or `Discovered` on creation | `Discovered` |
+| unknown future value | preserve current lifecycle, or `Discovered` on creation | preserve current lifecycle, or `Discovered` on creation |
 
 A thread missing from a later snapshot is not stopped. `Stopped` still
-requires an explicit reliable event.
+requires an explicit reliable event. A runtime status is considered live only
+when the compatibility gate has verified that the separate App Server sees and
+accurately reports the relevant client runtime. Merely parsing the field does
+not grant that authority.
 
-The native session identity is the Codex thread ID, not the shared session-tree
-root ID. Parent selection prefers `parentThreadId`, then the allowlisted
-subagent source parent field for compatible older schemas. The shared
-session-tree ID may be ignored until Grove has a separate tree-root concept.
+For root threads, the native session identity is the Codex thread ID, not the
+shared session-tree root ID. Parent selection prefers `parentThreadId`, then
+the allowlisted subagent-source parent field for compatible older schemas.
+Child identity follows the guarded reconciliation rules in "Identity and
+runtime namespace"; an older or ambiguous shape never silently substitutes one
+identifier for another.
+
+### Controlled App Server compatibility gate
+
+Cross-client behavior is an empirical capability, not an architectural
+assumption. Grove provides an explicit, local compatibility procedure for each
+configured adapter instance. It observes already-open user sessions and never
+creates, resumes, prompts, or otherwise mutates a Codex thread.
+
+The procedure checks:
+
+1. whether a separately launched App Server can see an existing desktop
+   session;
+2. whether it can see an existing CLI session;
+3. whether App Server parent/child relationships agree with hook
+   `session_id`/`agent_id` relationships;
+4. whether reported runtime status matches the observed client lifecycle;
+5. whether `useStateDbOnly` returns sufficient safe metadata without a rollout
+   scan or repair path;
+6. whether the installed CLI and desktop protocol/build versions can safely
+   access the same provider-managed state through the official endpoint.
+
+The desktop/CLI visibility and runtime-status checks use user-confirmed
+checkpoints while the user drives existing clients; Grove itself performs no
+client mutation. Parent/child equality may use bounded identifiers transiently
+in memory, but emits and persists aggregate matches, mismatches, and collision
+counts only. To verify no rollout scan, a platform audit harness records
+allowlisted path categories and open counts—not filenames or contents—and
+fails the check if the App Server opens a rollout/JSONL category. When that
+audit is unavailable or inconclusive, the no-scan outcome remains `Unknown`.
+Version compatibility runs the same sparse read-only listing against each
+installed build and compares only aggregate schema outcomes.
+
+Results contain only the protocol/build tuple, a state-store compatibility
+outcome (`Compatible`, `Incompatible`, or `Unknown`), tri-state capability
+flags, booleans, and aggregate counts. The procedure never prints or stores
+thread IDs, agent IDs, directories, titles, previews, raw frames, hook
+payloads, or executable paths. It must use the same sparse allowlisted parsers
+as production.
+
+The results gate behavior independently:
+
+- safe snapshot discovery requires verified `useStateDbOnly` and a verified
+  no-rollout-scan audit;
+- cross-client visibility is enabled only for the client categories actually
+  observed;
+- App Server status can affect lifecycle only when cross-client runtime status
+  is verified for that category;
+- hook/App Server child reconciliation is enabled only when parent and child ID
+  equality is verified with no aggregate collisions;
+- an incompatible or unrecognized protocol/build tuple or state-store outcome
+  resets affected capabilities to `Unknown`.
+
+The client relies only on the negotiated `useStateDbOnly` contract. It never
+falls back to a rollout scan, direct database read, state-file read, or
+filesystem-based recovery check. A failed or inconclusive procedure leaves the
+corresponding capability `Unknown` and hook-only operation remains available.
 
 ### Hook bridge
 
 Add an opt-in command:
 
 ```text
-grove provider-hook codex
+grove provider-hook codex [--instance <public-alias>]
 ```
 
 The command:
 
 - runs in the Codex session working directory;
-- reads one hook JSON object from stdin with a streaming sparse deserializer;
+- reads at most 256 KiB containing one hook JSON object from stdin with a
+  streaming sparse deserializer;
 - materializes only approved identifiers, directory, event name, safe source,
   safe reason, subagent ID, and bounded agent type;
 - ignores transcript paths, prompts, assistant messages, model names,
   permission mode, and all tool data;
-- normalizes the input into the provider-neutral lifecycle event;
-- finds the nearest existing `.grove` directory without creating one;
-- publishes the safe event to the existing Grove Unix socket with a short
-  timeout;
-- emits no successful stdout or stderr output;
+- maps the input into a bounded safe Codex hook-ingress record carrying the
+  explicit public alias, or no alias for a sole/default Codex instance;
+- searches upward for the nearest existing `.grove` directory only to locate
+  an existing Grove transport, without creating one;
+- opens the transport with a 100 ms connect timeout, performs one bounded write
+  with a 100 ms write timeout, and enforces a 250 ms total budget;
+- performs no retry, daemon auto-start, response read, acknowledgement wait,
+  stdout/stderr output, or log write;
+- closes immediately after the one write and always exits successfully,
+  including for malformed input, ambiguous instances, missing transports, and
+  timeouts;
 - behaves as best-effort observability so a missing Grove daemon cannot block a
   Codex session.
 
-The CLI sends only the normalized safe event. Raw hook JSON never crosses the
-Grove socket.
+The CLI sends only the bounded safe ingress record. Raw hook JSON never crosses
+the Grove socket.
 
-The daemon exposes a narrow local mutation method for normalized provider
-events. The request is bounded and parsed into the shared lifecycle type. A
-provider ingress hub forwards Codex events to the `CodexAdapter` listener, and
-the generic provider task forwards them to `DaemonState`. This keeps provider
-task ownership and shutdown ordering consistent with OpenCode.
+The daemon exposes a narrow local ingress method. It revalidates the bounded
+record, resolves the public alias to a configured opaque adapter instance ID,
+and assigns the trusted `observed_time`, `source`, and `source_confidence`
+before creating a provider-neutral observation. It ignores any workspace claim
+from the transport path, canonicalizes the event directory, and binds it to the
+most-specific existing registered workspace whose root contains that
+directory. If no registered workspace matches, the session remains unbound;
+the hook bridge cannot create or choose a workspace.
+
+A provider ingress hub forwards Codex events to the named `CodexAdapter`
+listener, and the generic provider task forwards them to `DaemonState`. This
+keeps provider task ownership and shutdown ordering consistent with OpenCode.
 
 No hook configuration is written automatically. Documentation will provide the
 exact opt-in configuration and explain Codex's hook trust review.
@@ -234,16 +447,45 @@ exact opt-in configuration and explain Codex's hook trust review.
 | `UserPromptSubmit` | `session_id` | existing root becomes `Active` |
 | `Stop` | `session_id` | existing root becomes `Idle` |
 | `SessionEnd` | `session_id` | existing root becomes `Stopped` |
-| `SubagentStart` | `agent_id`, parent=`session_id` | complete child upsert, `Active` |
-| `SubagentStop` | `agent_id`, parent=`session_id` | existing child becomes `Stopped` |
+| `SubagentStart` | session=`session_id`, agent=`agent_id`, parent=`session_id` | complete child upsert, `Active` |
+| `SubagentStop` | session=`session_id`, agent=`agent_id`, parent=`session_id` | existing child becomes `Stopped` |
 
 Partial activity or stop events for an unknown session do not create incomplete
 records. A later complete start hook or App Server snapshot recovers the
 session.
 
+### Lifecycle semantics
+
+- `Discovered`: an allowlisted snapshot proves that the native session exists,
+  but Grove has no authoritative live-state evidence.
+- `Active`: a complete start/activity hook, or compatibility-verified runtime
+  status, proves that work is active.
+- `Idle`: an explicit root `Stop` hook, or compatibility-verified runtime
+  status, proves that the session is loaded but not active.
+- `Stopped`: an explicit reliable `SessionEnd` or `SubagentStop` hook proves
+  termination. Snapshot disappearance, `notLoaded`, process exit, disconnect,
+  and timeout cannot produce this state.
+- `Stale`: a previously live-observed (`Active` or `Idle`) session has not
+  received reliable evidence within the configured threshold. It remains known
+  but its current live state is uncertain.
+
+The Codex adapter's `live_stale_after` defaults to 30 minutes and is clamped to
+at least three snapshot poll intervals when snapshots are enabled. It applies
+only to `Active` and `Idle`. When it expires without a newer authoritative hook
+or verified runtime-status observation, Grove transitions to `Stale`, never
+`Stopped`. `Discovered` and `Stopped` do not change merely because time passes.
+A later complete start or activity event may move `Stale`, `Idle`, or `Stopped`
+back to `Active`.
+
+For equal-authority observations, an explicit provider event time orders
+events from the same source; otherwise Grove ingress order does. Duplicate
+events are idempotent. A stale or out-of-order stop cannot override a newer
+start from the same source.
+
 `SessionStart`, `SubagentStart`, snapshot updates, and existing registry
-rebinding preserve the most-specific registered Grove workspace. Snapshot
-`Discovered` updates cannot downgrade a live hook-derived lifecycle.
+rebinding all pass their reported directory through daemon-side canonical
+most-specific workspace binding. Snapshot metadata can fill missing approved
+fields but cannot downgrade a live hook-derived lifecycle.
 
 ## Privacy boundary
 
@@ -279,9 +521,12 @@ The following rules are enforced in code and tests:
   initialized child.
 - A failed snapshot does not mutate or clear existing sessions.
 - Hook parse failures produce no provider mutation and do not echo input.
-- Hook socket failures are best-effort and do not block Codex.
+- Hook parse, routing, and socket failures are silent, always return success,
+  perform no retry, and stay within the hook command's 250 ms total budget.
 - Broadcast lag triggers a recovery snapshot when safe snapshots are
   available; otherwise Grove waits for the next complete lifecycle event.
+- Adapter disconnect and observation timeout can make an `Active` session
+  `Stale`, but cannot make any session `Stopped`.
 - Daemon shutdown stops provider listeners, terminates the App Server child,
   stops polling, and only then shuts down the state actor.
 
@@ -289,43 +534,76 @@ The following rules are enforced in code and tests:
 
 The first implementation supports:
 
-- default App Server executable resolution through `PATH`;
+- one or more Codex adapter entries, each with a stable Grove-issued UUID and a
+  non-secret public alias;
+- default App Server executable resolution through `PATH` for the default
+  entry;
 - an optional `GROVE_CODEX_APP_SERVER_PATH` executable-path override whose
-  value is never logged;
+  value is never logged and applies only to that default entry;
+- explicit per-entry executable configuration for additional instances;
 - an always-available local Codex hook ingress when the Grove daemon is
   running;
 - documented, user-installed hook entries for `SessionStart`,
   `UserPromptSubmit`, `Stop`, `SessionEnd`, `SubagentStart`, and
   `SubagentStop`.
 
-The hook command does not auto-start Grove or create `.grove`. This prevents a
-Codex lifecycle event from unexpectedly mutating an ordinary folder. Global
-daemon discovery and native-Windows-to-WSL routing remain later hardening work.
+The hook command does not auto-start Grove or create `.grove`. A single/default
+entry may omit `--instance`; multiple entries require an explicit public alias,
+which the daemon resolves to the stored opaque UUID. Unknown or ambiguous
+aliases are silently discarded. This prevents a Codex lifecycle event from
+unexpectedly mutating an ordinary folder or crossing adapter namespaces.
+Global daemon discovery and native-Windows-to-WSL routing remain later
+hardening work.
 
 ## Test strategy
 
 Tests are written first and must demonstrate:
 
 1. Forbidden hook fields are ignored and never appear in normalized output,
-   errors, or Debug.
-2. Every approved hook event maps to the specified root or child lifecycle.
-3. Unknown events, invalid IDs, invalid roles, and relative or empty
-   directories fail closed.
-4. Partial events for unknown sessions do not create incomplete sessions.
-5. The socket accepts only bounded normalized provider events.
-6. Hook ingestion traverses the adapter listener before reaching
+   errors, logs, or Debug.
+2. Every approved hook event maps to the specified root or collision-scoped
+   child lifecycle.
+3. The same native IDs in two adapter instances remain distinct; equal agent
+   IDs under different roots also remain distinct.
+4. Unknown events, invalid IDs, invalid roles, unknown instance aliases, and
+   relative or empty directories fail closed.
+5. Partial events for unknown sessions do not create incomplete sessions.
+6. The socket accepts only bounded safe hook-ingress records, rejects
+   caller-supplied workspace ownership, and assigns trusted observation
+   metadata inside the daemon.
+7. Daemon-side directory binding chooses the most-specific registered
+   workspace and leaves unmatched sessions unbound.
+8. A fake unavailable, slow-reading, and never-responding daemon proves the
+   hook performs one connect/write attempt, waits for no response, emits
+   nothing, exits success, and stays within its total budget.
+9. Hook ingestion traverses the named adapter listener before reaching
    `DaemonState`.
-7. Snapshot pagination maps only approved thread fields.
-8. Preview, title, turns, model, and raw error text are absent from snapshot
-   structures and diagnostics.
-9. `useStateDbOnly` rejection disables safe snapshots without an unsafe retry.
-10. Parent IDs work with both current and compatible older allowlisted shapes.
-11. Snapshot `Discovered` state does not downgrade hook-derived `Active` state.
-12. Provider tasks honor unsupported capabilities.
-13. App Server transport recovery and daemon shutdown cancel and await all
+10. Snapshot pagination maps only approved thread fields.
+11. Preview, title, turns, model, and raw error text are absent from snapshot
+    structures and diagnostics.
+12. `useStateDbOnly` rejection disables safe snapshots without an unsafe retry
+    or rollout scan.
+13. Every negotiated capability preserves `Supported`, `Unsupported`, and
+    `Unknown`; missing optional fields and future enum values remain `Unknown`
+    and fail closed.
+14. Parent IDs work with both current and compatible older allowlisted shapes
+    without guessing child identity.
+15. The full source-authority table is enforced: snapshots may enrich
+    metadata, but process/static hints never create sessions and lower
+    authority never overwrites newer authoritative lifecycle.
+16. Snapshot disappearance, disconnect, and elapsed timeout never yield
+    `Stopped`; only the specified explicit hooks do, and live timeout yields
+    `Stale`.
+17. Duplicate and out-of-order observations are idempotent and cannot let an
+    older stop override a newer start from the same source.
+18. Provider tasks honor unsupported and unknown capabilities.
+19. App Server transport recovery and daemon shutdown cancel and await all
     owned work.
-14. A metadata-only compatibility procedure reports aggregate counts and
-    capability flags only; it never prints IDs, paths, or raw protocol data.
+20. The controlled desktop/CLI procedure gates cross-client visibility,
+    parent/child reconciliation, runtime status, state-database-only metadata,
+    and protocol/build compatibility independently.
+21. Compatibility output contains aggregate outcomes and flags only; it never
+    prints IDs, paths, titles, payloads, or raw protocol data.
 
 Required verification includes focused unit and integration tests, daemon
 tests, formatting, workspace check, Clippy, full workspace tests with only the
@@ -333,16 +611,21 @@ documented terminal-specific skips when necessary, and a workspace build.
 
 ## Delivery slices
 
-Implementation proceeds in four bounded slices:
+Implementation proceeds in five bounded slices:
 
-1. Move normalized events to a provider-neutral type and make provider tasks
-   honor capabilities without changing OpenCode behavior.
-2. Add sparse Codex hook parsing, lifecycle normalization, safe socket ingress,
-   and the opt-in CLI hook command.
-3. Add the state-database-only App Server snapshot client and compose it into
+1. Introduce provider-neutral observations, adapter-scoped root/agent identity,
+   source authority, ordering, and lifecycle precedence without changing
+   OpenCode behavior.
+2. Add tri-state capability negotiation and make generic provider tasks honor
+   unsupported and unknown capabilities.
+3. Add sparse Codex hook parsing, collision-safe lifecycle normalization,
+   daemon-side workspace binding, bounded one-way socket ingress, and the
+   opt-in CLI hook command.
+4. Add the state-database-only App Server snapshot client, sparse metadata
+   recovery, and controlled compatibility gates, then compose them into
    `CodexAdapter`.
-4. Add documentation, aggregate-only compatibility checks, full verification,
-   and a focused commit.
+5. Add opt-in configuration documentation, aggregate-only compatibility
+   reporting, full verification, and focused commits.
 
 ## Alternatives considered
 
