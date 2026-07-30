@@ -157,16 +157,28 @@ File activity now serializes attribution confidence and candidate session
 identities. Session responses expose only `AgentSession`'s allowlisted fields
 and are ordered newest-first.
 
-### Future provider abstraction
+### Provider adapter boundary
 
-OpenCode-specific network schemas stay outside shared registry code. The next
-adapter interface should normalize:
+OpenCode-specific network schemas stay outside shared registry and task
+orchestration code. `grove-daemon::provider` defines an object-safe
+`ProviderAdapter` boundary for:
 
-- snapshot discovery;
-- lifecycle events;
-- health/recovery state;
-- optional exact file activity;
-- optional parent/child relationships.
+- allowlisted session snapshots;
+- normalized lifecycle events;
+- sanitized provider errors;
+- declared snapshot, event, and health capabilities;
+- explicit optional exact-file and parent/child capabilities.
+
+`OpenCodeAdapter` owns the provider-specific snapshot and SSE clients and maps
+their safe results into this contract. `ProviderTasks` owns the generic
+immediate/periodic poller and snapshot-before-connect event supervisor. Daemon
+startup constructs one adapter object, and ordered shutdown cancels and awaits
+both tasks before stopping `DaemonState`.
+
+OpenCode currently declares full metadata snapshots, lifecycle events,
+connection-state health, native parent IDs, and no exact file attribution.
+The generic runners have metadata-only fake-adapter contract tests and no
+OpenCode-specific response schema assumptions.
 
 Codex and Claude Code adapters must prefer official hooks, APIs, plugins, or
 explicit metadata publishing. Process scanning is only a fallback presence

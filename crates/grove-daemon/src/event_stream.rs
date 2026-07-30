@@ -203,28 +203,6 @@ impl EventStreamClient {
     }
 }
 
-/// Metadata-safe source of normalized agent events.
-///
-/// Provider adapters implement this boundary so reconnect orchestration does
-/// not depend on provider-specific response bodies.
-pub trait AgentEventSource: Send + Sync {
-    fn listen(
-        &self,
-        events_tx: tokio::sync::mpsc::Sender<AgentEvent>,
-        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    ) -> impl std::future::Future<Output = Result<(), EventStreamError>> + Send;
-}
-
-impl AgentEventSource for EventStreamClient {
-    async fn listen(
-        &self,
-        events_tx: tokio::sync::mpsc::Sender<AgentEvent>,
-        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<(), EventStreamError> {
-        EventStreamClient::listen(self, events_tx, shutdown_rx).await
-    }
-}
-
 // ── SSE parser (private) ────────────────────────────────────────────────
 
 /// Incremental SSE parser that yields `AgentEvent` values.

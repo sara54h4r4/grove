@@ -1,11 +1,18 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use grove_lib::{AgentProvider, DiscoverySource, SessionLifecycle};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
+use crate::event_stream::{AgentEvent, EventStreamClient, EventStreamError};
+use crate::provider::{
+    AdapterFuture, EventCapability, ExactFileActivityCapability, HealthCapability,
+    ParentSessionCapability, ProviderAdapter, ProviderAdapterError, ProviderCapabilities,
+    SnapshotCapability,
+};
 use crate::session_registry::SessionUpdate;
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -42,6 +49,101 @@ impl fmt::Display for OpenCodeError {
 }
 
 impl std::error::Error for OpenCodeError {}
+
+/// Provider-neutral OpenCode adapter composed from the metadata snapshot and
+/// event-stream clients.
+pub struct OpenCodeAdapter {
+    snapshot_client: OpenCodeClient,
+    event_client: EventStreamClient,
+}
+
+impl OpenCodeAdapter {
+    pub const CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
+        snapshots: SnapshotCapability::FullMetadata,
+        events: EventCapability::LifecycleStream,
+        health: HealthCapability::ConnectionState,
+        exact_file_activity: ExactFileActivityCapability::Unsupported,
+        parent_sessions: ParentSessionCapability::NativeIds,
+    };
+
+    pub fn new(base_url: &str, username: &str, password: &str) -> Self {
+        Self {
+            snapshot_client: OpenCodeClient::new(base_url, username, password),
+            event_client: EventStreamClient::new(base_url, username, password),
+        }
+    }
+}
+
+impl fmt::Debug for OpenCodeAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenCodeAdapter")
+            .field("provider", &AgentProvider::OpenCode)
+            .field("capabilities", &Self::CAPABILITIES)
+            .finish()
+    }
+}
+
+impl ProviderAdapter for OpenCodeAdapter {
+    fn provider(&self) -> AgentProvider {
+        AgentProvider::OpenCode
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        Self::CAPABILITIES
+    }
+
+    fn fetch_snapshot(
+        &self,
+    ) -> AdapterFuture<'_, Result<Vec<SessionUpdate>, ProviderAdapterError>> {
+        Box::pin(async move {
+            self.snapshot_client
+                .fetch_session_snapshot()
+                .await
+                .map_err(ProviderAdapterError::from)
+        })
+    }
+
+    fn listen(
+        &self,
+        events_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> AdapterFuture<'_, Result<(), ProviderAdapterError>> {
+        Box::pin(async move {
+            self.event_client
+                .listen(events_tx, shutdown_rx)
+                .await
+                .map_err(ProviderAdapterError::from)
+        })
+    }
+}
+
+impl From<OpenCodeError> for ProviderAdapterError {
+    fn from(error: OpenCodeError) -> Self {
+        match error {
+            OpenCodeError::InvalidUrl | OpenCodeError::RequestFailed => Self::RequestFailed,
+            OpenCodeError::AuthenticationFailed => Self::AuthenticationFailed,
+            OpenCodeError::UnexpectedStatusCode(code) => Self::UnexpectedStatusCode(code),
+            OpenCodeError::MalformedResponse => Self::MalformedMetadata,
+            OpenCodeError::MissingRequiredField(_) | OpenCodeError::InvalidTimestamp => {
+                Self::InvalidMetadata
+            }
+            OpenCodeError::PaginationLoop => Self::PaginationFailed,
+        }
+    }
+}
+
+impl From<EventStreamError> for ProviderAdapterError {
+    fn from(error: EventStreamError) -> Self {
+        match error {
+            EventStreamError::RequestFailed => Self::RequestFailed,
+            EventStreamError::AuthenticationFailed => Self::AuthenticationFailed,
+            EventStreamError::UnexpectedStatusCode(code) => Self::UnexpectedStatusCode(code),
+            EventStreamError::InvalidEventStream => Self::InvalidEventStream,
+            EventStreamError::ChannelClosed => Self::ChannelClosed,
+            EventStreamError::Shutdown => Self::Shutdown,
+        }
+    }
+}
 
 // ── Client ────────────────────────────────────────────────────────────────
 
@@ -180,270 +282,6 @@ impl OpenCodeClient {
     }
 }
 
-// ── Snapshot client trait ─────────────────────────────────────────────────
-
-/// Trait for fetching session snapshots.
-///
-/// Implementations must not log credentials, response bodies,
-/// or any sensitive content such as titles, messages, commands, or tool data.
-pub trait SnapshotClient: Send + Sync {
-    fn fetch_snapshot(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<SessionUpdate>, OpenCodeError>> + Send;
-}
-
-impl SnapshotClient for OpenCodeClient {
-    async fn fetch_snapshot(&self) -> Result<Vec<SessionUpdate>, OpenCodeError> {
-        self.fetch_session_snapshot().await
-    }
-}
-
-// ── Polling loop ──────────────────────────────────────────────────────────
-
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-
-use crate::state::StateMessage;
-
-/// Run a polling loop that fetches OpenCode session snapshots on an interval.
-///
-/// Behaviour:
-/// - Fetches once immediately on call.
-/// - Then fetches once per `interval`.
-/// - Successful snapshots are forwarded to `state_tx` as
-///   [`StateMessage::AgentSessionUpdates`].
-/// - On fetch error the error is logged at `WARN` and polling continues
-///   (the error is never propagated).
-/// - Requests never overlap: if the previous fetch is still running when the
-///   next interval tick arrives, the tick is skipped.
-/// - Exits immediately when `shutdown_rx` resolves.
-///
-/// # Sensitive data
-///
-/// This function never logs credentials, response bodies, titles, messages,
-/// commands, tool data, or any other sensitive content.
-pub async fn run_opencode_polling<C>(
-    client: C,
-    state_tx: mpsc::Sender<StateMessage>,
-    interval: Duration,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) where
-    C: SnapshotClient + 'static,
-{
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            _ = ticker.tick() => {
-                let result = client.fetch_snapshot().await;
-                match result {
-                    Ok(updates) => {
-                        if !updates.is_empty() {
-                            let _ = state_tx
-                                .send(StateMessage::AgentSessionUpdates { updates })
-                                .await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "opencode poll failed, will retry");
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Spawn the OpenCode polling loop as a background task.
-///
-/// Returns a shutdown sender and the task handle. Callers should send `()`
-/// through the shutdown sender and await the handle during daemon shutdown.
-pub fn spawn_opencode_poller<C: SnapshotClient + 'static>(
-    client: C,
-    state_tx: mpsc::Sender<StateMessage>,
-    interval: Duration,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let handle = tokio::spawn(run_opencode_polling(
-        client,
-        state_tx,
-        interval,
-        shutdown_rx,
-    ));
-    (shutdown_tx, handle)
-}
-
-/// Reconnect timing for the OpenCode event stream.
-#[derive(Debug, Clone, Copy)]
-pub struct ReconnectPolicy {
-    pub initial_delay: Duration,
-    pub max_delay: Duration,
-}
-
-impl Default for ReconnectPolicy {
-    fn default() -> Self {
-        Self {
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(30),
-        }
-    }
-}
-
-impl ReconnectPolicy {
-    fn next_delay(self, current: Duration) -> Duration {
-        current
-            .saturating_mul(2)
-            .min(self.max_delay.max(self.initial_delay))
-    }
-}
-
-/// Run OpenCode's live event stream with cancellation and snapshot recovery.
-///
-/// A full allowlisted session snapshot is fetched before every connection,
-/// including the initial one. Stream failures use bounded exponential backoff.
-/// Raw response bodies and event payloads are never logged.
-pub async fn run_opencode_event_stream<S, E>(
-    snapshot_client: S,
-    event_source: E,
-    state_tx: mpsc::Sender<StateMessage>,
-    reconnect_policy: ReconnectPolicy,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) where
-    S: SnapshotClient + 'static,
-    E: crate::event_stream::AgentEventSource + 'static,
-{
-    let mut reconnect_delay = reconnect_policy.initial_delay;
-
-    loop {
-        let snapshot = tokio::select! {
-            biased;
-            _ = &mut shutdown_rx => return,
-            result = snapshot_client.fetch_snapshot() => result,
-        };
-
-        match snapshot {
-            Ok(updates) => {
-                if !updates.is_empty()
-                    && state_tx
-                        .send(StateMessage::AgentSessionUpdates { updates })
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "opencode recovery snapshot failed, delaying event-stream connection"
-                );
-                if !wait_for_reconnect(reconnect_delay, &mut shutdown_rx).await {
-                    return;
-                }
-                reconnect_delay = reconnect_policy.next_delay(reconnect_delay);
-                continue;
-            }
-        }
-
-        let (events_tx, mut events_rx) = mpsc::channel(64);
-        let (connection_shutdown_tx, connection_shutdown_rx) = oneshot::channel();
-        let listen = event_source.listen(events_tx, connection_shutdown_rx);
-        tokio::pin!(listen);
-        let mut connection_shutdown_tx = Some(connection_shutdown_tx);
-        let mut received_event = false;
-
-        let stream_result = loop {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => {
-                    if let Some(tx) = connection_shutdown_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    let _ = listen.await;
-                    return;
-                }
-                result = &mut listen => break result,
-                event = events_rx.recv() => {
-                    let Some(event) = event else {
-                        continue;
-                    };
-                    received_event = true;
-                    if state_tx
-                        .send(StateMessage::AgentSessionEvent { event })
-                        .await
-                        .is_err()
-                    {
-                        if let Some(tx) = connection_shutdown_tx.take() {
-                            let _ = tx.send(());
-                        }
-                        let _ = listen.await;
-                        return;
-                    }
-                }
-            }
-        };
-
-        // The listener owns the final sender. Once it returns, draining cannot
-        // block and prevents losing events queued immediately before EOF.
-        while let Some(event) = events_rx.recv().await {
-            received_event = true;
-            if state_tx
-                .send(StateMessage::AgentSessionEvent { event })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-
-        match stream_result {
-            Ok(()) => tracing::warn!("opencode event stream closed, reconnecting"),
-            Err(crate::event_stream::EventStreamError::Shutdown) => return,
-            Err(error) => {
-                tracing::warn!(error = %error, "opencode event stream failed, reconnecting");
-            }
-        }
-
-        if received_event {
-            reconnect_delay = reconnect_policy.initial_delay;
-        }
-        if !wait_for_reconnect(reconnect_delay, &mut shutdown_rx).await {
-            return;
-        }
-        reconnect_delay = reconnect_policy.next_delay(reconnect_delay);
-    }
-}
-
-async fn wait_for_reconnect(delay: Duration, shutdown_rx: &mut oneshot::Receiver<()>) -> bool {
-    tokio::select! {
-        biased;
-        _ = shutdown_rx => false,
-        _ = tokio::time::sleep(delay) => true,
-    }
-}
-
-/// Spawn the recovery-aware OpenCode event-stream loop.
-pub fn spawn_opencode_event_stream<
-    S: SnapshotClient + 'static,
-    E: crate::event_stream::AgentEventSource + 'static,
->(
-    snapshot_client: S,
-    event_source: E,
-    state_tx: mpsc::Sender<StateMessage>,
-    reconnect_policy: ReconnectPolicy,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let handle = tokio::spawn(run_opencode_event_stream(
-        snapshot_client,
-        event_source,
-        state_tx,
-        reconnect_policy,
-        shutdown_rx,
-    ));
-    (shutdown_tx, handle)
-}
-
 /// Default polling interval for OpenCode session snapshots.
 pub const OPENCODE_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -558,6 +396,33 @@ mod tests {
         let handle = std::thread::spawn(move || {
             if let Some(Ok(stream)) = listener.incoming().next() {
                 write_response(stream, status, &body);
+            }
+        });
+        (url, MockServer(Some(handle)))
+    }
+
+    /// Spawn a one-shot mock that exits if the client never connects.
+    fn spawn_optional_mock(response_body: &str, status: u16) -> (String, MockServer) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("set mock listener nonblocking");
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let body = response_body.to_string();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        write_response(stream, status, &body);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
             }
         });
         (url, MockServer(Some(handle)))
@@ -1017,6 +882,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adapter_declares_opencode_metadata_capabilities() {
+        use crate::provider::{
+            EventCapability, ExactFileActivityCapability, HealthCapability,
+            ParentSessionCapability, ProviderAdapter, ProviderCapabilities, SnapshotCapability,
+        };
+
+        let adapter = OpenCodeAdapter::new("http://localhost:8080", "user", "pass");
+        let adapter: &dyn ProviderAdapter = &adapter;
+
+        assert_eq!(adapter.provider(), AgentProvider::OpenCode);
+        assert_eq!(
+            adapter.capabilities(),
+            ProviderCapabilities {
+                snapshots: SnapshotCapability::FullMetadata,
+                events: EventCapability::LifecycleStream,
+                health: HealthCapability::ConnectionState,
+                exact_file_activity: ExactFileActivityCapability::Unsupported,
+                parent_sessions: ParentSessionCapability::NativeIds,
+            }
+        );
+    }
+
+    #[test]
+    fn adapter_debug_redacts_connection_configuration() {
+        let adapter = OpenCodeAdapter::new(
+            "http://url-user:url-pass@localhost:8080/private-token?access_token=query-secret",
+            "basic-user",
+            "basic-pass",
+        );
+        let debug = format!("{adapter:?}");
+
+        for secret in [
+            "url-user",
+            "url-pass",
+            "private-token",
+            "query-secret",
+            "basic-user",
+            "basic-pass",
+        ] {
+            assert!(!debug.contains(secret), "Debug exposed {secret}: {debug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_maps_snapshot_authentication_failure_to_sanitized_error() {
+        use crate::provider::{ProviderAdapter, ProviderAdapterError};
+
+        let (url, _server) = spawn_mock("", 401);
+        let adapter = OpenCodeAdapter::new(&url, "user", "pass");
+
+        let error = ProviderAdapter::fetch_snapshot(&adapter).await.unwrap_err();
+
+        assert_eq!(error, ProviderAdapterError::AuthenticationFailed);
+        assert_eq!(error.to_string(), "provider authentication failed");
+    }
+
+    #[tokio::test]
+    async fn adapter_forwards_normalized_lifecycle_events() {
+        use crate::provider::ProviderAdapter;
+        use tokio::sync::{mpsc, oneshot};
+
+        let body =
+            "data: {\"type\":\"message.updated\",\"data\":{\"sessionID\":\"session-1\"}}\n\n";
+        let (url, _server) = spawn_optional_mock(body, 200);
+        let adapter = OpenCodeAdapter::new(&url, "user", "pass");
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        ProviderAdapter::listen(&adapter, events_tx, shutdown_rx)
+            .await
+            .expect("event stream should close normally");
+
+        let event = events_rx.recv().await.expect("normalized event");
+        assert_eq!(event.provider, AgentProvider::OpenCode);
+        assert_eq!(event.native_session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            event.event_kind,
+            crate::event_stream::EventKind::MessageUpdated
+        );
+    }
+
     // ── Metadata-only live compatibility procedure ────────────────────
 
     #[tokio::test]
@@ -1059,405 +1006,5 @@ mod tests {
             parent_links,
             roles
         );
-    }
-
-    // ── Poller tests ──────────────────────────────────────────────────
-
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    type FakeSnapshotResult = Result<Vec<SessionUpdate>, OpenCodeError>;
-
-    /// A fake client that returns pre-programmed results in FIFO order.
-    struct FakeSnapshotClient {
-        results: Arc<Mutex<VecDeque<FakeSnapshotResult>>>,
-    }
-
-    impl FakeSnapshotClient {
-        fn new(results: Vec<FakeSnapshotResult>) -> Self {
-            Self {
-                results: Arc::new(Mutex::new(VecDeque::from(results))),
-            }
-        }
-    }
-
-    impl SnapshotClient for FakeSnapshotClient {
-        async fn fetch_snapshot(&self) -> Result<Vec<SessionUpdate>, OpenCodeError> {
-            self.results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(Vec::new()))
-        }
-    }
-
-    fn dummy_session(id: &str) -> SessionUpdate {
-        SessionUpdate {
-            provider: AgentProvider::OpenCode,
-            native_session_id: id.to_string(),
-            parent_native_session_id: None,
-            agent_role: None,
-            directory: PathBuf::from("/tmp"),
-            lifecycle: SessionLifecycle::Discovered,
-            discovery_source: DiscoverySource::ApiPoll,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
-    /// Helper: run the poller, expect a single AgentSessionUpdates, then shut down.
-    async fn expect_one_update(
-        client: FakeSnapshotClient,
-        interval: Duration,
-    ) -> Vec<SessionUpdate> {
-        tokio::time::pause();
-
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let handle = tokio::spawn(run_opencode_polling(
-            client,
-            state_tx,
-            interval,
-            shutdown_rx,
-        ));
-
-        let msg = state_rx.recv().await.expect("should receive a message");
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
-
-        match msg {
-            StateMessage::AgentSessionUpdates { updates } => updates,
-            _ => panic!("expected AgentSessionUpdates"),
-        }
-    }
-
-    #[tokio::test]
-    async fn immediate_first_fetch() {
-        let updates = expect_one_update(
-            FakeSnapshotClient::new(vec![Ok(vec![dummy_session("ses-1")])]),
-            Duration::from_secs(60),
-        )
-        .await;
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].native_session_id, "ses-1");
-    }
-
-    #[tokio::test]
-    async fn repeated_interval_fetches() {
-        tokio::time::pause();
-
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let client = FakeSnapshotClient::new(vec![
-            Ok(vec![dummy_session("ses-1")]),
-            Ok(vec![dummy_session("ses-2")]),
-        ]);
-
-        let interval = Duration::from_secs(10);
-        let handle = tokio::spawn(run_opencode_polling(
-            client,
-            state_tx,
-            interval,
-            shutdown_rx,
-        ));
-
-        // First fetch is immediate
-        let msg1 = state_rx.recv().await.unwrap();
-        let updates1 = match msg1 {
-            StateMessage::AgentSessionUpdates { updates } => updates,
-            _ => panic!("expected AgentSessionUpdates"),
-        };
-        assert_eq!(updates1[0].native_session_id, "ses-1");
-
-        // Advance past the interval to trigger the second fetch
-        tokio::time::advance(Duration::from_secs(10)).await;
-        let msg2 = state_rx.recv().await.unwrap();
-        let updates2 = match msg2 {
-            StateMessage::AgentSessionUpdates { updates } => updates,
-            _ => panic!("expected AgentSessionUpdates"),
-        };
-        assert_eq!(updates2[0].native_session_id, "ses-2");
-
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn successful_updates_sent_to_state_message() {
-        let updates = expect_one_update(
-            FakeSnapshotClient::new(vec![Ok(vec![
-                dummy_session("alpha"),
-                dummy_session("beta"),
-            ])]),
-            Duration::from_secs(60),
-        )
-        .await;
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].native_session_id, "alpha");
-        assert_eq!(updates[1].native_session_id, "beta");
-    }
-
-    #[tokio::test]
-    async fn temporary_failure_followed_by_successful_retry() {
-        tokio::time::pause();
-
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let client = FakeSnapshotClient::new(vec![
-            Err(OpenCodeError::RequestFailed),
-            Ok(vec![dummy_session("ses-retry")]),
-        ]);
-
-        let interval = Duration::from_secs(10);
-        let handle = tokio::spawn(run_opencode_polling(
-            client,
-            state_tx,
-            interval,
-            shutdown_rx,
-        ));
-
-        // First fetch (immediate) fails — no message sent
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // No message should be available yet because only the failed immediate fetch happened
-        let no_msg = state_rx.try_recv();
-        assert!(no_msg.is_err(), "no message expected after failure");
-
-        // Advance past the interval so the retry fires
-        tokio::time::advance(Duration::from_secs(10)).await;
-        let msg = state_rx.recv().await.unwrap();
-        let updates = match msg {
-            StateMessage::AgentSessionUpdates { updates } => updates,
-            _ => panic!("expected AgentSessionUpdates"),
-        };
-        assert_eq!(updates[0].native_session_id, "ses-retry");
-
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_stops_further_polling() {
-        tokio::time::pause();
-
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let client = FakeSnapshotClient::new(vec![
-            Ok(vec![dummy_session("first")]),
-            Ok(vec![dummy_session("second")]),
-        ]);
-
-        let interval = Duration::from_secs(10);
-        let handle = tokio::spawn(run_opencode_polling(
-            client,
-            state_tx,
-            interval,
-            shutdown_rx,
-        ));
-
-        // Receive the immediate first fetch
-        let msg = state_rx.recv().await.unwrap();
-        match msg {
-            StateMessage::AgentSessionUpdates { updates } => {
-                assert_eq!(updates[0].native_session_id, "first");
-            }
-            _ => panic!("expected AgentSessionUpdates"),
-        }
-
-        // Shut down before the interval fires
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
-
-        // No more messages should be sent
-        let no_msg = state_rx.try_recv();
-        assert!(no_msg.is_err(), "no message expected after shutdown");
-    }
-
-    // ── Wiring tests ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn spawn_opencode_poller_starts_immediate_fetch() {
-        tokio::time::pause();
-
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let client = FakeSnapshotClient::new(vec![Ok(vec![dummy_session("wire-test")])]);
-        let (shutdown_tx, handle) =
-            spawn_opencode_poller(client, state_tx, Duration::from_secs(10));
-
-        let msg = state_rx.recv().await.unwrap();
-        match msg {
-            StateMessage::AgentSessionUpdates { updates } => {
-                assert_eq!(updates.len(), 1);
-                assert_eq!(updates[0].native_session_id, "wire-test");
-            }
-            _ => panic!("expected AgentSessionUpdates"),
-        }
-
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn spawn_opencode_poller_shutdown_stops_poller() {
-        tokio::time::pause();
-
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let client = FakeSnapshotClient::new(vec![Ok(vec![dummy_session("shutdown-test")])]);
-        let (shutdown_tx, handle) =
-            spawn_opencode_poller(client, state_tx, Duration::from_secs(10));
-
-        // Receive the immediate first fetch
-        let msg = state_rx.recv().await.unwrap();
-        match msg {
-            StateMessage::AgentSessionUpdates { .. } => {}
-            _ => panic!("expected AgentSessionUpdates"),
-        }
-
-        // Shut down before the next interval
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
-
-        // No more messages after shutdown
-        let no_msg = state_rx.try_recv();
-        assert!(no_msg.is_err(), "no message expected after shutdown");
-    }
-
-    #[test]
-    fn no_configuration_no_poller() {
-        let config = crate::state::GroveConfig::default();
-        assert!(config.opencode.is_none());
-
-        // Verify the same logic used in run_inner: map on None returns None
-        let poller: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> = config
-            .opencode
-            .as_ref()
-            .map(|_| unreachable!("should not be called when opencode is None"));
-        assert!(poller.is_none());
-    }
-
-    enum FakeListenResult {
-        Return(Result<(), crate::event_stream::EventStreamError>),
-        WaitForShutdown,
-    }
-
-    type FakeEventScript = (Vec<crate::event_stream::AgentEvent>, FakeListenResult);
-
-    struct FakeAgentEventSource {
-        scripts: Arc<Mutex<VecDeque<FakeEventScript>>>,
-    }
-
-    impl FakeAgentEventSource {
-        fn new(scripts: Vec<FakeEventScript>) -> Self {
-            Self {
-                scripts: Arc::new(Mutex::new(VecDeque::from(scripts))),
-            }
-        }
-    }
-
-    impl crate::event_stream::AgentEventSource for FakeAgentEventSource {
-        async fn listen(
-            &self,
-            events_tx: mpsc::Sender<crate::event_stream::AgentEvent>,
-            shutdown_rx: oneshot::Receiver<()>,
-        ) -> Result<(), crate::event_stream::EventStreamError> {
-            let (events, result) = self
-                .scripts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("unexpected event-stream connection");
-            for event in events {
-                events_tx.send(event).await.unwrap();
-            }
-            match result {
-                FakeListenResult::Return(result) => result,
-                FakeListenResult::WaitForShutdown => {
-                    let _ = shutdown_rx.await;
-                    Err(crate::event_stream::EventStreamError::Shutdown)
-                }
-            }
-        }
-    }
-
-    fn fake_agent_event(native_session_id: &str) -> crate::event_stream::AgentEvent {
-        crate::event_stream::AgentEvent {
-            provider: AgentProvider::OpenCode,
-            native_session_id: Some(native_session_id.to_string()),
-            parent_native_session_id: None,
-            event_kind: crate::event_stream::EventKind::MessageUpdated,
-            timestamp: None,
-            lifecycle: None,
-            agent_role: None,
-            directory: None,
-            compacted: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn event_stream_recovers_snapshot_before_each_connection_and_stops_cleanly() {
-        tokio::time::pause();
-
-        let snapshots = FakeSnapshotClient::new(vec![
-            Ok(vec![dummy_session("snapshot-1")]),
-            Ok(vec![dummy_session("snapshot-2")]),
-        ]);
-        let events = FakeAgentEventSource::new(vec![
-            (
-                vec![fake_agent_event("event-1")],
-                FakeListenResult::Return(Err(crate::event_stream::EventStreamError::RequestFailed)),
-            ),
-            (
-                vec![fake_agent_event("event-2")],
-                FakeListenResult::WaitForShutdown,
-            ),
-        ]);
-        let (state_tx, mut state_rx) = mpsc::channel(16);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let handle = tokio::spawn(run_opencode_event_stream(
-            snapshots,
-            events,
-            state_tx,
-            ReconnectPolicy {
-                initial_delay: Duration::from_secs(1),
-                max_delay: Duration::from_secs(8),
-            },
-            shutdown_rx,
-        ));
-
-        match state_rx.recv().await.unwrap() {
-            StateMessage::AgentSessionUpdates { updates } => {
-                assert_eq!(updates[0].native_session_id, "snapshot-1");
-            }
-            _ => panic!("snapshot must precede first event-stream connection"),
-        }
-        match state_rx.recv().await.unwrap() {
-            StateMessage::AgentSessionEvent { event } => {
-                assert_eq!(event.native_session_id.as_deref(), Some("event-1"));
-            }
-            _ => panic!("expected first normalized event"),
-        }
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-
-        match state_rx.recv().await.unwrap() {
-            StateMessage::AgentSessionUpdates { updates } => {
-                assert_eq!(updates[0].native_session_id, "snapshot-2");
-            }
-            _ => panic!("recovery snapshot must precede reconnection"),
-        }
-        match state_rx.recv().await.unwrap() {
-            StateMessage::AgentSessionEvent { event } => {
-                assert_eq!(event.native_session_id.as_deref(), Some("event-2"));
-            }
-            _ => panic!("expected second normalized event"),
-        }
-
-        shutdown_tx.send(()).unwrap();
-        handle.await.unwrap();
     }
 }

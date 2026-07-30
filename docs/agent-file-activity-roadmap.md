@@ -62,23 +62,27 @@ coordination, with file activity as one signal.
 
 - [x] Focused registry, event, SSE recovery, configuration, attribution, and
   socket tests.
-- [x] Daemon suite: 311 passed, 1 explicitly configured live test ignored.
+- [x] Daemon suite: 310 passed, 1 explicitly configured live test ignored.
 - [x] Formatting, workspace check, Clippy, workspace tests, and workspace build
   passed after all current code edits.
 - [x] Full workspace tests passed with only the two documented desktop-terminal
   skips; baseline Clippy warnings are recorded in the handoff report.
 
+## Provider adapter abstraction
+
+- [x] Define an object-safe provider-neutral adapter contract.
+- [x] Model snapshot, lifecycle-event, and health capabilities.
+- [x] Model exact-file and parent/child capabilities explicitly.
+- [x] Add sanitized provider-neutral adapter error categories.
+- [x] Put OpenCode snapshot and SSE clients behind `OpenCodeAdapter`.
+- [x] Move polling, reconnect recovery, and ordered shutdown into generic
+  `ProviderTasks`.
+- [x] Remove the superseded OpenCode-specific orchestration traits and loops.
+- [x] Add metadata-only fake-adapter and concrete OpenCode contract tests.
+
 ## Next three implementation stages
 
-### 1. Provider adapter abstraction
-
-- [ ] Define provider-neutral snapshot/event/health capabilities.
-- [ ] Move OpenCode task ownership behind the interface without changing its
-  verified behavior.
-- [ ] Model optional exact-file and parent/child capabilities explicitly.
-- [ ] Add contract tests using metadata-only fakes.
-
-### 2. Codex metadata investigation and adapter
+### 1. Codex metadata investigation and adapter
 
 - [ ] Investigate official APIs/hooks/plugins with a narrow metadata-only
   experiment.
@@ -86,17 +90,22 @@ coordination, with file activity as one signal.
 - [ ] Implement only safe identity/lifecycle/directory data actually supported.
 - [ ] Use process presence only as a clearly marked fallback.
 
-### 3. Claude Code metadata investigation and adapter
+### 2. Claude Code metadata investigation and adapter
 
 - [ ] Repeat the official-surface and privacy audit independently.
 - [ ] Do not read conversation JSONL/transcript bodies or infer chat identity
   from a shared process.
 - [ ] Normalize only verified safe metadata through the provider interface.
 
-## Later stages
+### 3. Coordination model and read APIs
 
 - [ ] Add explicit `AgentTask`, `ResourceClaim`, dependency, and `Handoff`
   models.
+- [ ] Add read-only conflict/dependency/claim queries before mutations.
+- [ ] Define expiry and heartbeat semantics without inferring intent.
+
+## Later stages
+
 - [ ] Add socket/CLI coordination queries and mutations with expiry/heartbeat.
 - [ ] Add an agent-readable local coordination interface such as MCP.
 - [ ] Add a basic session/activity/attribution view to the existing TUI.
