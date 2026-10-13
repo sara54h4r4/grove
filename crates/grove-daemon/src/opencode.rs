@@ -405,10 +405,7 @@ mod tests {
     ///
     /// Client construction can take longer than a fixed deadline on macOS.
     /// Cancellation still lets a failed client test join the server thread.
-    fn spawn_cancellable_mock(
-        response_body: &str,
-        status: u16,
-    ) -> (String, CancellableMockServer) {
+    fn spawn_cancellable_mock(response_body: &str, status: u16) -> (String, CancellableMockServer) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         listener
             .set_nonblocking(true)
