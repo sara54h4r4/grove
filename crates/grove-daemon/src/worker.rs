@@ -898,7 +898,7 @@ impl Billing {
             changeset
                 .changed_files
                 .iter()
-                .any(|f| f.path == PathBuf::from("src/lib.rs")),
+                .any(|f| f.path == std::path::Path::new("src/lib.rs")),
             "uncommitted dirty file should appear in changeset"
         );
 
@@ -906,7 +906,7 @@ impl Billing {
         let file = changeset
             .changed_files
             .iter()
-            .find(|f| f.path == PathBuf::from("src/lib.rs"))
+            .find(|f| f.path == std::path::Path::new("src/lib.rs"))
             .expect("src/lib.rs should be in changeset");
         assert!(!file.hunks.is_empty(), "dirty file should have diff hunks");
     }
@@ -956,7 +956,7 @@ impl Billing {
         let file = changeset
             .changed_files
             .iter()
-            .find(|f| f.path == PathBuf::from("src/lib.rs"))
+            .find(|f| f.path == std::path::Path::new("src/lib.rs"))
             .expect("src/lib.rs should be in changeset");
 
         // Should see hunks covering both changes (line 1 and line 3).

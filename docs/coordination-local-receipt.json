@@ -1,0 +1,24 @@
+{
+  "assertions": 32,
+  "service_delivery_roundtrip_ms": 66.68,
+  "service_first_read_delay_ms": 38,
+  "explicit_ack_delay_ms": 129,
+  "missed_messages": 0,
+  "duplicate_message_effects": 0,
+  "incomplete_transfer_unresolved": [
+    "AGENTS.md",
+    "config.json",
+    "guide.md",
+    "runtime.test.js"
+  ],
+  "restart_recovery": "passed",
+  "mcp": {
+    "tool_count": 12,
+    "negotiated_protocol": "2025-03-26"
+  },
+  "transport": "authenticated loopback HTTP from isolated clone; not a cross-host/cloud proof",
+  "codex_models": "not used; see separate real-session demonstration",
+  "semantic_acceptance_review": "simulated fixture operator",
+  "false_alarms": "not measured against independently labeled real workloads",
+  "manual_intervention": "zero within scripted fixture; real service hosting and credentials require operator setup"
+}

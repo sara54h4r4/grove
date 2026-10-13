@@ -1,5 +1,8 @@
 # Grove Agent Activity and Coordination Design
 
+Historical design. See [coordination.md](coordination.md) for implemented Codex
+coordination, current storage placement, hosting and bounded capabilities.
+
 ## Status
 
 This is the working design for `feature/agent-file-activity`. The feature has

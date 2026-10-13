@@ -91,13 +91,42 @@ impl SocketResponse {
 
 #[derive(Debug)]
 enum ParsedRequest {
+    Coordinate {
+        repository_id: Option<String>,
+        command: Box<grove_lib::coordination::CoordCommand>,
+        operator: bool,
+    },
     Query(QueryRequest),
     Subscribe,
-    SyncWorktrees { desired: Vec<grove_lib::Workspace> },
+    SyncWorktrees {
+        desired: Vec<grove_lib::Workspace>,
+    },
 }
 
 fn parse_request(request: &SocketRequest) -> Result<ParsedRequest, String> {
     match request.method.as_str() {
+        "coordinate" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Envelope {
+                repository_id: Option<String>,
+                command: grove_lib::coordination::CoordCommand,
+                #[serde(default)]
+                approver_token: Option<String>,
+            }
+            let envelope: Envelope = serde_json::from_value(request.params.clone())
+                .map_err(|_| "invalid coordination request".to_string())?;
+            let configured = std::env::var("GROVE_COORD_APPROVER_TOKEN").ok();
+            let operator = crate::codex::credential_matches(
+                configured.as_deref(),
+                envelope.approver_token.as_deref(),
+            );
+            Ok(ParsedRequest::Coordinate {
+                repository_id: envelope.repository_id,
+                command: Box::new(envelope.command),
+                operator,
+            })
+        }
         "status" => Ok(ParsedRequest::Query(QueryRequest::GetStatus)),
         "list_workspaces" => Ok(ParsedRequest::Query(QueryRequest::ListWorkspaces)),
         "get_workspace" => {
@@ -845,6 +874,36 @@ async fn handle_request_with_options(
     };
 
     let (response, enter_streaming) = match parsed {
+        ParsedRequest::Coordinate {
+            repository_id,
+            command,
+            operator,
+        } => {
+            let (reply, receive) = oneshot::channel();
+            if state_tx
+                .send(StateMessage::Coordinate {
+                    repository_id,
+                    command: *command,
+                    operator,
+                    reply,
+                })
+                .await
+                .is_err()
+            {
+                (SocketResponse::error("daemon state unavailable"), false)
+            } else {
+                match timeout(state_reply_timeout, receive).await {
+                    Ok(Ok(Ok(data))) => (SocketResponse::success(data), false),
+                    Ok(Ok(Err(error))) => (SocketResponse::error(error), false),
+                    _ => (
+                        SocketResponse::error(
+                            "coordination response unavailable; retry using the same deduplication key",
+                        ),
+                        false,
+                    ),
+                }
+            }
+        }
         ParsedRequest::Query(query) => match query {
             QueryRequest::AwaitAnalysis { timeout_ms } => {
                 let (reply_tx, reply_rx) = oneshot::channel();

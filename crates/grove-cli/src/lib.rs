@@ -1,6 +1,8 @@
 pub mod bootstrap;
 pub mod client;
 pub mod commands;
+pub mod coordination;
+pub mod transfer;
 
 use std::path::PathBuf;
 
@@ -27,6 +29,17 @@ pub struct CliArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
+    /// Durable agent coordination (local or authenticated shared service)
+    Coord {
+        #[command(subcommand)]
+        action: coordination::CoordAction,
+    },
+    /// Expose coordination tools to Codex through the official MCP SDK
+    Mcp {
+        /// Repository/worktree; defaults to the inherited working directory
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Show workspace status overview
     Status,
 
@@ -81,6 +94,14 @@ pub enum DaemonAction {
 pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Error>> {
     // Handle commands that don't require a grove workspace or daemon connection.
     match &args.command {
+        Some(Commands::Coord { action }) => {
+            coordination::run(action).await?;
+            std::process::exit(0);
+        }
+        Some(Commands::Mcp { repo }) => {
+            coordination::serve_mcp(repo.as_deref()).await?;
+            std::process::exit(0);
+        }
         Some(Commands::Init { shell }) => {
             commands::init::execute(shell)?;
             // No client needed/created for init
@@ -148,7 +169,11 @@ pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Erro
             commands::conflicts::execute(&client, &a, &b, args.json).await?;
         }
         // Already handled above; included for exhaustive matching.
-        Some(Commands::Daemon { .. }) | Some(Commands::Ci { .. }) | Some(Commands::Init { .. }) => {
+        Some(Commands::Coord { .. })
+        | Some(Commands::Mcp { .. })
+        | Some(Commands::Daemon { .. })
+        | Some(Commands::Ci { .. })
+        | Some(Commands::Init { .. }) => {
             unreachable!("handled above");
         }
     }
@@ -212,6 +237,12 @@ fn read_shutdown_token_file(
 
 /// Walk up from the given directory looking for a `.grove/` directory.
 fn find_grove_dir(start: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(ctx) = bootstrap::resolve_git_context() {
+        let shared = bootstrap::grove_dir_from_context(&ctx);
+        if shared.is_dir() {
+            return Ok(shared);
+        }
+    }
     let mut dir = start;
     loop {
         let grove = dir.join(".grove");

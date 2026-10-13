@@ -51,3 +51,7 @@ jobs:
 
       - name: Format check
         run: cargo fmt --check
+
+      - name: Coordination acceptance (disposable repositories, no model calls)
+        if: runner.os == 'Linux'
+        run: python3 scripts/coordination_acceptance.py --binary target/debug/grove

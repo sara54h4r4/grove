@@ -2,7 +2,10 @@
 
 Date: 2026-07-29
 
-Status: Awaiting written-spec re-review after required revisions
+Status: Historical proposal, superseded for the implemented milestone by
+[the current coordination guide](../../coordination.md). App Server snapshots
+and lifecycle hooks below have not been implemented; explicit official MCP
+registration is the current Codex path.
 
 ## Summary
 

@@ -156,6 +156,9 @@ fn format_cli_error(error: &impl Display, json: bool) -> String {
 /// This duplicates the logic in `grove-cli` intentionally: the binary crate needs
 /// the grove directory before handing off to the daemon, independently of CLI.
 fn find_grove_dir() -> Result<std::path::PathBuf, String> {
+    if let Ok(ctx) = grove_cli::bootstrap::resolve_git_context() {
+        return grove_cli::bootstrap::ensure_grove_dir(&ctx);
+    }
     let dir = std::env::current_dir().map_err(|e| format!("cannot get current directory: {e}"))?;
     find_grove_dir_from(dir)
 }

@@ -167,6 +167,12 @@ impl Default for GroveConfig {
 // === State Messages ===
 
 pub enum StateMessage {
+    Coordinate {
+        repository_id: Option<String>,
+        command: grove_lib::coordination::CoordCommand,
+        operator: bool,
+        reply: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
     FileChanged {
         workspace_id: WorkspaceId,
         path: PathBuf,
@@ -475,6 +481,16 @@ impl DaemonState {
                     self.handle_query(request, reply);
                     false
                 }
+                StateMessage::Coordinate {
+                    repository_id,
+                    command,
+                    operator,
+                    reply,
+                } => {
+                    let result = self.coordinate(repository_id.as_deref(), command, operator);
+                    let _ = reply.send(result);
+                    false
+                }
                 StateMessage::BaseRefChanged { new_commit } => {
                     self.handle_base_ref_changed(new_commit);
                     false
@@ -581,6 +597,9 @@ impl DaemonState {
                 StateMessage::AgentSessionUpdates { .. } => {
                     debug!("dropping agent session updates queued after shutdown");
                 }
+                StateMessage::Coordinate { reply, .. } => {
+                    let _ = reply.send(Err("daemon is shutting down".into()));
+                }
                 StateMessage::AgentSessionEvent { .. } => {
                     debug!("dropping agent session event queued after shutdown");
                 }
@@ -600,6 +619,75 @@ impl DaemonState {
     }
 
     // === Message Handlers ===
+
+    fn coordinate(
+        &mut self,
+        repository_id: Option<&str>,
+        mut command: grove_lib::coordination::CoordCommand,
+        operator: bool,
+    ) -> Result<serde_json::Value, String> {
+        use grove_lib::coordination::CoordCommand;
+        // Remote metadata is an assertion. Only independently checked local
+        // HEAD/worktree metadata gets the local_git label.
+        let observation = match &mut command {
+            CoordCommand::Register { observation, .. }
+            | CoordCommand::Heartbeat { observation, .. } => observation.as_mut(),
+            _ => None,
+        };
+        if let Some(obs) = observation {
+            obs.verification = "client_reported".into();
+            if self
+                .workspaces
+                .values()
+                .any(|w| w.path.to_string_lossy() == obs.worktree)
+                && let Ok(repo) = gix::discover(&obs.worktree)
+                && std::fs::read_to_string(repo.git_dir().join("grove-worktree-id"))
+                    .is_ok_and(|id| id.trim() == obs.worktree_id)
+                && self
+                    .config
+                    .grove_dir
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.canonicalize().ok())
+                    == repo.common_dir().canonicalize().ok()
+                && repo
+                    .head_id()
+                    .is_ok_and(|id| id.to_hex().to_string() == obs.commit)
+                && repo.head_name().ok().flatten().is_some_and(|name| {
+                    name.as_bstr().to_string().strip_prefix("refs/heads/") == Some(&obs.branch)
+                })
+            {
+                obs.verification = "local_git".into();
+            }
+        }
+        let db = self
+            .db
+            .as_mut()
+            .ok_or("durable coordination requires a database")?;
+        let sync = matches!(&command, CoordCommand::Sync { .. });
+        let mut result = crate::coordination::execute(
+            &mut db.conn,
+            repository_id,
+            command,
+            chrono::Utc::now().timestamp_millis(),
+            operator,
+        )
+        .map_err(|e| e.to_string())?;
+        if sync {
+            result["local_change_analyses"] =
+                serde_json::to_value(self.pair_analyses.values().collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?;
+        }
+        // The legacy registry is a projection of persisted Codex registrations.
+        if let Ok(sessions) =
+            crate::coordination::sessions(&db.conn, chrono::Utc::now().timestamp_millis())
+        {
+            for update in sessions.iter().filter_map(crate::codex::normalize) {
+                self.session_registry.upsert(update);
+            }
+        }
+        Ok(result)
+    }
 
     async fn handle_file_changed(&mut self, workspace_id: WorkspaceId, path: &Path) {
         if !self.workspaces.contains_key(&workspace_id) {
@@ -769,6 +857,14 @@ impl DaemonState {
     fn handle_agent_session_updates(&mut self, updates: Vec<SessionUpdate>) {
         let count = updates.len();
         for update in updates {
+            if update.provider == AgentProvider::Codex
+                && self
+                    .session_registry
+                    .get(update.provider, &update.native_session_id)
+                    .is_some_and(|s| update.updated_at.is_some_and(|t| t < s.updated_at))
+            {
+                continue;
+            }
             self.session_registry.upsert(update);
         }
         debug!(count, "applied agent session updates");

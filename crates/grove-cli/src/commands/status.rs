@@ -18,13 +18,13 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
     let ws_resp = client.list_workspaces().await?;
     let workspaces = ws_resp
         .data
-        .and_then(|v| if v.is_array() { Some(v) } else { None })
+        .filter(|v| v.is_array())
         .unwrap_or_else(|| serde_json::json!([]));
 
     let analyses_resp = client.get_all_analyses().await?;
     let analyses = analyses_resp
         .data
-        .and_then(|v| if v.is_array() { Some(v) } else { None })
+        .filter(|v| v.is_array())
         .unwrap_or_else(|| serde_json::json!([]));
 
     if json {

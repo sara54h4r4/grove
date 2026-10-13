@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["iad1"],
+  "functions": {"api/coord.rs": {"maxDuration": 30}},
+  "rewrites": [{"source": "/coord", "destination": "/api/coord"}]
+}

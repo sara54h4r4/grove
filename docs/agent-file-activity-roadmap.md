@@ -1,5 +1,8 @@
 # Grove Agent Activity Roadmap
 
+Historical feature-branch roadmap. The current milestone, setup and remaining
+work are maintained in [coordination.md](coordination.md).
+
 Last updated: 2026-07-29
 
 This is the running checklist for `feature/agent-file-activity`. The current

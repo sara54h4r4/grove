@@ -33,6 +33,7 @@ pub struct DaemonResponse {
 
 // === Client ===
 
+#[derive(Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
 }

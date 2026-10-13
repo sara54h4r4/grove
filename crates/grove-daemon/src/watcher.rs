@@ -310,7 +310,7 @@ impl Debouncer {
             {
                 // Sorting + dedup was measurably faster than hash-based dedup in
                 // the current workload profile and keeps deterministic ordering.
-                let mut unique_paths: Vec<PathBuf> = state.pending_changes.drain(..).collect();
+                let mut unique_paths: Vec<PathBuf> = std::mem::take(&mut state.pending_changes);
                 unique_paths.sort();
                 unique_paths.dedup();
 
