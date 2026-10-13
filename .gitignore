@@ -31,6 +31,7 @@ scripts/__pycache__/
 !docs/
 docs/*
 !docs/coordination.md
+!docs/codex-cloud-agent-prompt.txt
 !docs/coordination-evidence.md
 !docs/coordination-local-receipt.json
 !docs/coordination-hosted-receipt.json

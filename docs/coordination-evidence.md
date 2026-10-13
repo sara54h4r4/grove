@@ -119,6 +119,16 @@ including recorded setup retries reported 3,503,217 aggregate input tokens
 usage. Currency billing is not exposed by the CLI; these are ordinary Codex
 account calls, not a recurring background agent.
 
+The follow-up Cloud setup guide uses a private wrapper because OpenAI's current
+environment documentation makes Secrets available only during setup. Its recipe
+was exercised against the hosted service with the original Secret environment
+variables absent: authenticated `hello` returned the pinned repository ID, real
+stdio MCP initialize/tools-list exposed all twelve allowlisted tools, and the
+official Codex CLI accepted the configuration. The runtime credential file and
+directory were 0600/0700, and the independent IWS checkout stayed clean without
+a local coordination database. This check used no model calls and ran in this
+workspace; the separate analytics environment still needs configuration.
+
 Receipts: [local](coordination-local-receipt.json),
 [hosted](coordination-hosted-receipt.json), and
 [real Codex sessions](coordination-codex-receipt.json). Complete public event logs
