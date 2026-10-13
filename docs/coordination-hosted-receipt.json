@@ -1,0 +1,18 @@
+{
+  "missing_participant_credential": 401,
+  "wrong_repository": 403,
+  "operator_role_enforced": 403,
+  "typed_request_enforced": 400,
+  "concurrent_requests": 8,
+  "durable_message_effects": 1,
+  "missed_messages": 0,
+  "concurrent_roundtrip_ms": 1167.93,
+  "service_first_read_delay_ms": 699,
+  "explicit_ack_delay_ms": 890,
+  "transport": "Codex Cloud workspace to Vercel HTTPS to Neon Postgres",
+  "sessions": "explicit synthetic fixture IDs, not native Codex models",
+  "fresh_deployment_recovery": true,
+  "recovered_prior_fixture_peers": 2,
+  "deployment_id": "dpl_ECaPiemRo1c8acjZy9WxvEkAhucx",
+  "repository_id": "13f4fc87-5296-4dd7-be15-e54a1a2a290b"
+}

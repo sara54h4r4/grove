@@ -68,7 +68,17 @@ fn main() {
             }
         };
 
-        let config = grove_daemon::state::GroveConfig::default();
+        let mut config = grove_daemon::state::GroveConfig::default();
+        match grove_daemon::state::OpenCodeConfig::from_env() {
+            Ok(Some(oc_config)) => {
+                config.opencode = Some(oc_config);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         if let Err(e) = rt.block_on(grove_daemon::run(config, &grove_dir)) {
             eprintln!("daemon error: {e}");
             std::process::exit(1);
@@ -146,6 +156,9 @@ fn format_cli_error(error: &impl Display, json: bool) -> String {
 /// This duplicates the logic in `grove-cli` intentionally: the binary crate needs
 /// the grove directory before handing off to the daemon, independently of CLI.
 fn find_grove_dir() -> Result<std::path::PathBuf, String> {
+    if let Ok(ctx) = grove_cli::bootstrap::resolve_git_context() {
+        return grove_cli::bootstrap::ensure_grove_dir(&ctx);
+    }
     let dir = std::env::current_dir().map_err(|e| format!("cannot get current directory: {e}"))?;
     find_grove_dir_from(dir)
 }

@@ -1,12 +1,21 @@
+pub mod agent_config;
+pub mod codex;
+pub mod coordination;
+pub mod coordination_snapshot;
 pub mod db;
+pub mod event_stream;
 pub(crate) mod git;
 pub mod lifecycle;
+pub mod opencode;
+pub mod provider;
+pub mod session_registry;
 pub mod socket;
 pub mod state;
 pub mod watcher;
 pub mod worker;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher};
@@ -104,6 +113,8 @@ async fn run_inner(
     info!(db_path = %paths.db_file.display(), "database opened");
 
     // Start state actor
+    let mut config = config.clone();
+    config.grove_dir = paths.pid_file.parent().map(Path::to_path_buf);
     let (state_tx, event_tx, state_handle) = state::spawn_state_actor(config.clone(), Some(db));
     info!("state actor started");
 
@@ -123,13 +134,9 @@ async fn run_inner(
         respect_gitignore: config.respect_gitignore,
     };
 
-    // .grove/ is always a sibling of .git/ (see bootstrap.rs:grove_dir_from_context)
-    let repo_git_dir = paths
-        .pid_file
-        .parent() // .grove/
-        .and_then(|p| p.parent()) // repo root
-        .map(|p| p.join(".git"))
-        .filter(|p| p.is_dir());
+    let repo_git_dir = gix::discover(".")
+        .ok()
+        .map(|r| r.common_dir().to_path_buf());
 
     // Create broadcast channel for coordinating shutdown across subsystems
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -142,6 +149,28 @@ async fn run_inner(
         Duration::from_millis(config.socket_state_reply_timeout_ms),
         watcher_shutdown_rx,
         repo_git_dir,
+    ));
+
+    // Start OpenCode behind the provider-neutral task boundary if configured.
+    let provider_tasks = config.opencode.as_ref().map(|oc_cfg| {
+        let adapter = Arc::new(crate::opencode::OpenCodeAdapter::new(
+            &oc_cfg.server_url,
+            &oc_cfg.username,
+            &oc_cfg.password,
+        ));
+        crate::provider::spawn_provider_tasks(
+            adapter,
+            state_tx.clone(),
+            crate::opencode::OPENCODE_POLL_INTERVAL,
+            crate::provider::ReconnectPolicy::default(),
+        )
+    });
+    let (codex_stop, codex_stop_rx) = tokio::sync::oneshot::channel();
+    let codex_poller = tokio::spawn(crate::provider::run_provider_polling(
+        Arc::new(crate::codex::CodexAdapter::new(paths.db_file.clone())),
+        state_tx.clone(),
+        crate::codex::POLL_INTERVAL,
+        codex_stop_rx,
     ));
 
     // Create and run socket server
@@ -188,6 +217,14 @@ async fn run_inner(
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!(error = %e, "watcher loop exited with error"),
         Err(e) => warn!(error = %e, "watcher loop task panicked"),
+    }
+
+    // Stop and await all provider tasks before shutting down the state actor.
+    let _ = codex_stop.send(());
+    let _ = codex_poller.await;
+    if let Some(tasks) = provider_tasks {
+        tasks.shutdown().await;
+        info!("provider integration stopped");
     }
 
     // Graceful shutdown: tell the state actor to drain and stop

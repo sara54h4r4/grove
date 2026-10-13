@@ -33,6 +33,7 @@ pub struct DaemonResponse {
 
 // === Client ===
 
+#[derive(Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
 }
@@ -151,6 +152,45 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn get_agent_assignments(&self) -> Result<DaemonResponse, ClientError> {
+        self.request("get_agent_assignments", serde_json::json!({}))
+            .await
+    }
+
+    pub async fn get_agent_sessions(
+        &self,
+        provider: Option<&str>,
+        workspace_id: Option<&str>,
+        lifecycle: Option<&str>,
+    ) -> Result<DaemonResponse, ClientError> {
+        let mut params = serde_json::json!({});
+        if let Some(p) = provider {
+            params["provider"] = serde_json::json!(p);
+        }
+        if let Some(wid) = workspace_id {
+            params["workspace_id"] = serde_json::json!(wid);
+        }
+        if let Some(lc) = lifecycle {
+            params["lifecycle"] = serde_json::json!(lc);
+        }
+        self.request("get_agent_sessions", params).await
+    }
+
+    pub async fn get_file_activity(
+        &self,
+        workspace_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<DaemonResponse, ClientError> {
+        let mut params = serde_json::json!({});
+        if let Some(wid) = workspace_id {
+            params["workspace_id"] = serde_json::json!(wid);
+        }
+        if let Some(n) = limit {
+            params["limit"] = serde_json::json!(n);
+        }
+        self.request("get_file_activity", params).await
+    }
+
     pub async fn sync_worktrees(
         &self,
         worktrees: serde_json::Value,
@@ -259,6 +299,78 @@ mod tests {
         assert_eq!(parsed["method"], "conflicts");
         assert_eq!(parsed["params"]["workspace_a"], "id-a");
         assert_eq!(parsed["params"]["workspace_b"], "id-b");
+    }
+
+    #[test]
+    fn get_file_activity_request_json_serializes_no_params() {
+        let params = serde_json::json!({});
+        let request = serde_json::json!({
+            "method": "get_file_activity",
+            "params": params,
+        });
+        let line = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "get_file_activity");
+        assert_eq!(parsed["params"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn get_file_activity_request_json_serializes_with_params() {
+        let mut params = serde_json::json!({});
+        params["workspace_id"] = serde_json::json!("abc-123");
+        params["limit"] = serde_json::json!(5);
+        let request = serde_json::json!({
+            "method": "get_file_activity",
+            "params": params,
+        });
+        let line = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "get_file_activity");
+        assert_eq!(parsed["params"]["workspace_id"], "abc-123");
+        assert_eq!(parsed["params"]["limit"], 5);
+    }
+
+    #[test]
+    fn get_agent_assignments_request_json_serializes_correctly() {
+        let request = serde_json::json!({
+            "method": "get_agent_assignments",
+            "params": {},
+        });
+        let line = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "get_agent_assignments");
+        assert_eq!(parsed["params"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn get_agent_sessions_request_json_serializes_no_params() {
+        let params = serde_json::json!({});
+        let request = serde_json::json!({
+            "method": "get_agent_sessions",
+            "params": params,
+        });
+        let line = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "get_agent_sessions");
+        assert_eq!(parsed["params"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn get_agent_sessions_request_json_serializes_with_all_filters() {
+        let mut params = serde_json::json!({});
+        params["provider"] = serde_json::json!("opencode");
+        params["workspace_id"] = serde_json::json!("abc-123");
+        params["lifecycle"] = serde_json::json!("active");
+        let request = serde_json::json!({
+            "method": "get_agent_sessions",
+            "params": params,
+        });
+        let line = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "get_agent_sessions");
+        assert_eq!(parsed["params"]["provider"], "opencode");
+        assert_eq!(parsed["params"]["workspace_id"], "abc-123");
+        assert_eq!(parsed["params"]["lifecycle"], "active");
     }
 
     #[test]

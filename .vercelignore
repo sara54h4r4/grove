@@ -1,0 +1,10 @@
+.env*
+.grove/
+.agents/
+.claude/
+target/
+action/
+npm/
+assets/
+scripts/
+docs/

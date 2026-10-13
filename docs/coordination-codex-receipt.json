@@ -1,0 +1,71 @@
+{
+  "passed": true,
+  "actual_native_sessions": {
+    "b": "codex:01a136a1-d944-73f3-a871-1d3c8c5717c5",
+    "a": "codex:01a136a1-d957-72d3-a35d-9df857770a81"
+  },
+  "same_session_resumed": true,
+  "operator_approval": "synthetic fixture",
+  "missed_messages": 0,
+  "duplicate_message_effects": 0,
+  "message_latencies": [
+    {
+      "kind": "request",
+      "service_first_read_delay_ms": 1742,
+      "model_ack_delay_ms": 8281
+    },
+    {
+      "kind": "handoff",
+      "service_first_read_delay_ms": 1394,
+      "model_ack_delay_ms": 9257
+    },
+    {
+      "kind": "progress",
+      "service_first_read_delay_ms": 13417,
+      "model_ack_delay_ms": 19907
+    }
+  ],
+  "transport": "remote HTTPS",
+  "elapsed_seconds": 74.42,
+  "model": "gpt-6.1-sol",
+  "usage": [
+    {
+      "input_tokens": 699661,
+      "cached_input_tokens": 644096,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 3531,
+      "reasoning_output_tokens": 138
+    },
+    {
+      "input_tokens": 710935,
+      "cached_input_tokens": 656896,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 4521,
+      "reasoning_output_tokens": 122
+    },
+    {
+      "input_tokens": 906393,
+      "cached_input_tokens": 842368,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 4173,
+      "reasoning_output_tokens": 138
+    }
+  ],
+  "decision_id": "grove-demo-4b4c6733b80b",
+  "scope": "_grove_acceptance/4b4c6733b80b",
+  "independent_codex_cloud_task_environments": false,
+  "tracked_iws_files_unchanged": true,
+  "completed_model_turns_including_setup_retries": 9,
+  "recorded_usage_totals_including_completed_retries": {
+    "input_tokens": 3503217,
+    "cached_input_tokens": 3196032,
+    "output_tokens": 20520
+  },
+  "currency_cost": "not exposed by Codex CLI; account usage applies",
+  "setup_issues_resolved": [
+    "expired CLI login; device authorization renewed",
+    "Codex server-scoped approval mode approve with twelve-tool allowlist",
+    "explicit MCP forwarding of Grove variables, Cloud proxies and CA trust"
+  ],
+  "manual_intervention": "Vercel CLI authorization, Neon Marketplace terms, Codex CLI authorization with one device-code retry; fixture operator approval automated for synthetic policy only"
+}

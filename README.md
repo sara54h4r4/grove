@@ -4,6 +4,14 @@ Cross-worktree conflict intelligence for git. Detects file, hunk, symbol, depend
 
 Grove watches your git worktrees, continuously analyzes pairwise overlaps, and tells you which branches will conflict before you merge. Perfect for your multi-agents working in parallel worktrees ;)
 
+This fork also supports explicit Codex registration, durable messages and decision
+acknowledgements, advisory claims, and whole-branch transfer accounting. Local
+worktrees share Git metadata; isolated Codex Cloud clients use an authenticated
+Vercel endpoint backed by Neon. See the [current setup and roadmap](docs/coordination.md)
+and [source evaluation and verification](docs/coordination-evidence.md).
+Build this fork from source with `cargo build --workspace`; upstream published
+packages do not contain this milestone.
+
 ![Grove TUI dashboard](assets/demo.png)
 
 ## Why

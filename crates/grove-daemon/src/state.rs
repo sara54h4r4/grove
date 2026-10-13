@@ -1,5 +1,11 @@
+use chrono::Utc;
 use grove_lib::graph::{GraphOverlay, ImportGraph};
-use grove_lib::{CommitHash, OrthogonalityScore, Workspace, WorkspaceId, WorkspacePairAnalysis};
+use grove_lib::{
+    AgentProvider, AgentSession, AgentSessionRef, AttributionConfidence, CommitHash,
+    DiscoverySource, FileActivity, FileAttribution, OrthogonalityScore, SessionLifecycle,
+    Workspace, WorkspaceId, WorkspacePairAnalysis,
+};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,10 +13,116 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
+use crate::agent_config::{self, AgentsConfig};
 use crate::db::Database;
+use crate::event_stream::{AgentEvent, EventKind};
+use crate::session_registry::{AgentSessionRegistry, SessionUpdate};
 use crate::worker::{WorkerMessage, build_base_graph_from_workspace, canonical_pair};
 
 // === Configuration ===
+
+/// Configuration for connecting to an OpenCode server.
+///
+/// Credentials are redacted in Debug output and never exposed in error
+/// messages, logs, or panic messages.
+#[derive(Clone)]
+pub struct OpenCodeConfig {
+    pub server_url: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
+}
+
+impl std::fmt::Debug for OpenCodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenCodeConfig")
+            .field("server_url", &"<configured>")
+            .field("username", &"***")
+            .field("password", &"***")
+            .finish()
+    }
+}
+
+impl OpenCodeConfig {
+    /// Read OpenCode connection settings from environment variables.
+    ///
+    /// Returns `Ok(None)` when `OPENCODE_SERVER_URL` is absent (integration disabled).
+    /// Returns `Ok(Some(...))` when all three variables are present and non-empty.
+    /// Returns `Err(...)` when URL is set but username or password is missing.
+    ///
+    /// Credentials are **never** included in any returned error message.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(std::env::var)
+    }
+
+    fn from_lookup(
+        mut variable: impl FnMut(&'static str) -> Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, String> {
+        let url = match variable("OPENCODE_SERVER_URL") {
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(_) => {
+                return Err("OPENCODE_SERVER_URL is set but not valid Unicode".to_string());
+            }
+        };
+
+        if url.trim().is_empty() {
+            return Err("OPENCODE_SERVER_URL is set but empty".to_string());
+        }
+        let url = url.trim();
+        validate_opencode_server_url(url)?;
+
+        let username = match variable("OPENCODE_SERVER_USERNAME") {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(
+                    "OPENCODE_SERVER_URL is set but OPENCODE_SERVER_USERNAME is not set"
+                        .to_string(),
+                );
+            }
+        };
+        if username.trim().is_empty() {
+            return Err(
+                "OPENCODE_SERVER_URL is set but OPENCODE_SERVER_USERNAME is empty".to_string(),
+            );
+        }
+
+        let password = match variable("OPENCODE_SERVER_PASSWORD") {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(
+                    "OPENCODE_SERVER_URL is set but OPENCODE_SERVER_PASSWORD is not set"
+                        .to_string(),
+                );
+            }
+        };
+        if password.trim().is_empty() {
+            return Err(
+                "OPENCODE_SERVER_URL is set but OPENCODE_SERVER_PASSWORD is empty".to_string(),
+            );
+        }
+
+        Ok(Some(Self {
+            server_url: url.to_string(),
+            username,
+            password,
+        }))
+    }
+}
+
+fn validate_opencode_server_url(value: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "OPENCODE_SERVER_URL must be a valid HTTP(S) URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("OPENCODE_SERVER_URL must use http or https".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("OPENCODE_SERVER_URL must not contain embedded credentials".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("OPENCODE_SERVER_URL must not contain a query or fragment".to_string());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct GroveConfig {
@@ -25,6 +137,8 @@ pub struct GroveConfig {
     pub circuit_breaker_threshold: usize,
     pub ignore_patterns: Vec<String>,
     pub respect_gitignore: bool,
+    pub grove_dir: Option<PathBuf>,
+    pub opencode: Option<OpenCodeConfig>,
 }
 
 impl Default for GroveConfig {
@@ -50,6 +164,8 @@ impl Default for GroveConfig {
                 "*.map".to_string(),
             ],
             respect_gitignore: true,
+            grove_dir: None,
+            opencode: None,
         }
     }
 }
@@ -57,6 +173,12 @@ impl Default for GroveConfig {
 // === State Messages ===
 
 pub enum StateMessage {
+    Coordinate {
+        repository_id: Option<String>,
+        command: grove_lib::coordination::CoordCommand,
+        operator: bool,
+        reply: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
     FileChanged {
         workspace_id: WorkspaceId,
         path: PathBuf,
@@ -98,6 +220,22 @@ pub enum StateMessage {
     AttachWorker {
         worker_tx: mpsc::Sender<WorkerMessage>,
     },
+    /// Submit one or more session updates from an agent adapter.
+    ///
+    /// Each update is upserted into the session registry.  Sessions *not*
+    /// present in this batch are **not** touched — in particular they are
+    /// never automatically transitioned to `Stopped`.
+    AgentSessionUpdates {
+        updates: Vec<SessionUpdate>,
+    },
+    /// A single event from the OpenCode event stream.
+    ///
+    /// The handler translates the provider-neutral [`AgentEvent`] into the
+    /// appropriate registry operations according to its [`EventKind`].
+    /// Events without a `native_session_id` are silently ignored.
+    AgentSessionEvent {
+        event: AgentEvent,
+    },
     Shutdown,
 }
 
@@ -124,6 +262,16 @@ pub enum QueryRequest {
     AwaitAnalysis {
         timeout_ms: u64,
     },
+    GetFileActivity {
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<usize>,
+    },
+    GetAgentAssignments,
+    GetAgentSessions {
+        provider: Option<AgentProvider>,
+        workspace_id: Option<WorkspaceId>,
+        lifecycle: Option<SessionLifecycle>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +289,9 @@ pub enum QueryResponse {
         in_flight: usize,
         analysis_count: usize,
     },
+    FileActivity(Vec<FileActivity>),
+    AgentAssignments(Vec<grove_lib::AgentAssignment>),
+    AgentSessions(Vec<AgentSession>),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -179,6 +330,8 @@ pub struct DaemonState {
     pair_analyses: HashMap<(WorkspaceId, WorkspaceId), WorkspacePairAnalysis>,
     dirty_workspaces: Vec<WorkspaceId>,
     in_flight_pairs: HashSet<(WorkspaceId, WorkspaceId)>,
+    file_activity: HashMap<WorkspaceId, HashMap<PathBuf, FileActivity>>,
+    agent_config: Option<AgentsConfig>,
     analysis_waiters: Vec<oneshot::Sender<QueryResponse>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
@@ -186,6 +339,7 @@ pub struct DaemonState {
     self_tx: Option<mpsc::Sender<StateMessage>>,
     base_graph_building: bool,
     base_graph_build_failed: bool,
+    session_registry: AgentSessionRegistry,
 }
 
 impl DaemonState {
@@ -208,6 +362,8 @@ impl DaemonState {
             pair_analyses: HashMap::new(),
             dirty_workspaces: Vec::new(),
             in_flight_pairs: HashSet::new(),
+            file_activity: HashMap::new(),
+            agent_config: None,
             analysis_waiters: Vec::new(),
             event_tx,
             worker_tx: None,
@@ -215,6 +371,7 @@ impl DaemonState {
             self_tx: None,
             base_graph_building: false,
             base_graph_build_failed: false,
+            session_registry: AgentSessionRegistry::new(),
         }
     }
 
@@ -244,6 +401,22 @@ impl DaemonState {
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load pair analyses from db");
+                }
+            }
+        }
+
+        // Load agent assignment configuration
+        if let Some(ref grove_dir) = self.config.grove_dir {
+            match agent_config::load_agents_config(grove_dir) {
+                Ok(Some(cfg)) => {
+                    info!(count = cfg.agents.len(), "loaded agent assignment config");
+                    self.agent_config = Some(cfg);
+                }
+                Ok(None) => {
+                    debug!("no agents.toml found, using fallback assignments");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load agent config");
                 }
             }
         }
@@ -280,6 +453,11 @@ impl DaemonState {
             }
         }
 
+        // Sync workspace paths into the session registry and bind any sessions
+        // that were persisted but may now match a workspace.
+        self.sync_session_registry_workspace_paths();
+        self.session_registry.rebind_all_sessions();
+
         self
     }
 
@@ -307,6 +485,16 @@ impl DaemonState {
                 }
                 StateMessage::Query { request, reply } => {
                     self.handle_query(request, reply);
+                    false
+                }
+                StateMessage::Coordinate {
+                    repository_id,
+                    command,
+                    operator,
+                    reply,
+                } => {
+                    let result = self.coordinate(repository_id.as_deref(), command, operator);
+                    let _ = reply.send(result);
                     false
                 }
                 StateMessage::BaseRefChanged { new_commit } => {
@@ -348,6 +536,14 @@ impl DaemonState {
                         debug!("sync reply channel dropped");
                     }
                     self.dispatch_dirty_workspaces().await;
+                    false
+                }
+                StateMessage::AgentSessionUpdates { updates } => {
+                    self.handle_agent_session_updates(updates);
+                    false
+                }
+                StateMessage::AgentSessionEvent { event } => {
+                    self.handle_agent_session_event(event);
                     false
                 }
                 StateMessage::AttachWorker { worker_tx } => {
@@ -404,6 +600,15 @@ impl DaemonState {
                 StateMessage::AttachWorker { .. } => {
                     debug!("dropping worker attachment queued after shutdown");
                 }
+                StateMessage::AgentSessionUpdates { .. } => {
+                    debug!("dropping agent session updates queued after shutdown");
+                }
+                StateMessage::Coordinate { reply, .. } => {
+                    let _ = reply.send(Err("daemon is shutting down".into()));
+                }
+                StateMessage::AgentSessionEvent { .. } => {
+                    debug!("dropping agent session event queued after shutdown");
+                }
                 StateMessage::FileChanged { .. }
                 | StateMessage::AnalysisComplete { .. }
                 | StateMessage::AnalysisFailure { .. }
@@ -421,6 +626,75 @@ impl DaemonState {
 
     // === Message Handlers ===
 
+    fn coordinate(
+        &mut self,
+        repository_id: Option<&str>,
+        mut command: grove_lib::coordination::CoordCommand,
+        operator: bool,
+    ) -> Result<serde_json::Value, String> {
+        use grove_lib::coordination::CoordCommand;
+        // Remote metadata is an assertion. Only independently checked local
+        // HEAD/worktree metadata gets the local_git label.
+        let observation = match &mut command {
+            CoordCommand::Register { observation, .. }
+            | CoordCommand::Heartbeat { observation, .. } => observation.as_mut(),
+            _ => None,
+        };
+        if let Some(obs) = observation {
+            obs.verification = "client_reported".into();
+            if self
+                .workspaces
+                .values()
+                .any(|w| w.path.to_string_lossy() == obs.worktree)
+                && let Ok(repo) = gix::discover(&obs.worktree)
+                && std::fs::read_to_string(repo.git_dir().join("grove-worktree-id"))
+                    .is_ok_and(|id| id.trim() == obs.worktree_id)
+                && self
+                    .config
+                    .grove_dir
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.canonicalize().ok())
+                    == repo.common_dir().canonicalize().ok()
+                && repo
+                    .head_id()
+                    .is_ok_and(|id| id.to_hex().to_string() == obs.commit)
+                && repo.head_name().ok().flatten().is_some_and(|name| {
+                    name.as_bstr().to_string().strip_prefix("refs/heads/") == Some(&obs.branch)
+                })
+            {
+                obs.verification = "local_git".into();
+            }
+        }
+        let db = self
+            .db
+            .as_mut()
+            .ok_or("durable coordination requires a database")?;
+        let sync = matches!(&command, CoordCommand::Sync { .. });
+        let mut result = crate::coordination::execute(
+            &mut db.conn,
+            repository_id,
+            command,
+            chrono::Utc::now().timestamp_millis(),
+            operator,
+        )
+        .map_err(|e| e.to_string())?;
+        if sync {
+            result["local_change_analyses"] =
+                serde_json::to_value(self.pair_analyses.values().collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?;
+        }
+        // The legacy registry is a projection of persisted Codex registrations.
+        if let Ok(sessions) =
+            crate::coordination::sessions(&db.conn, chrono::Utc::now().timestamp_millis())
+        {
+            for update in sessions.iter().filter_map(crate::codex::normalize) {
+                self.session_registry.upsert(update);
+            }
+        }
+        Ok(result)
+    }
+
     async fn handle_file_changed(&mut self, workspace_id: WorkspaceId, path: &Path) {
         if !self.workspaces.contains_key(&workspace_id) {
             warn!(workspace_id = %workspace_id, "file change for unknown workspace");
@@ -429,11 +703,103 @@ impl DaemonState {
 
         debug!(workspace_id = %workspace_id, path = %path.display(), "file changed");
 
+        // Track file activity: convert absolute watcher path to workspace-relative
+        if let Some(workspace) = self.workspaces.get(&workspace_id) {
+            match path.strip_prefix(&workspace.path) {
+                Ok(relative) if !relative.as_os_str().is_empty() => {
+                    let now = Utc::now();
+                    let relative = relative.to_path_buf();
+                    let attribution = self.attribute_file_change(workspace, now);
+                    self.file_activity
+                        .entry(workspace_id)
+                        .or_default()
+                        .entry(relative.clone())
+                        .and_modify(|entry| {
+                            entry.last_changed_at = now;
+                            entry.change_count += 1;
+                            entry.attribution = attribution.clone();
+                        })
+                        .or_insert_with(|| FileActivity {
+                            workspace_id,
+                            relative_path: relative,
+                            first_changed_at: now,
+                            last_changed_at: now,
+                            change_count: 1,
+                            attribution,
+                        });
+                }
+                Ok(_) => {
+                    debug!(workspace_id = %workspace_id, "file change at worktree root, ignoring");
+                }
+                Err(_) => {
+                    debug!(
+                        workspace_id = %workspace_id,
+                        path = %path.display(),
+                        worktree = %workspace.path.display(),
+                        "file change outside worktree, ignoring"
+                    );
+                }
+            }
+        }
+
         if !self.dirty_workspaces.contains(&workspace_id) {
             self.dirty_workspaces.push(workspace_id);
         }
 
         self.dispatch_dirty_workspaces().await;
+    }
+
+    fn attribute_file_change(
+        &self,
+        workspace: &Workspace,
+        attributed_at: chrono::DateTime<Utc>,
+    ) -> FileAttribution {
+        let mut sessions: Vec<AgentSessionRef> = self
+            .session_registry
+            .all()
+            .into_iter()
+            .filter(|session| {
+                session.workspace_id == Some(workspace.id)
+                    && session.lifecycle == SessionLifecycle::Active
+            })
+            .map(|session| AgentSessionRef {
+                provider: session.provider,
+                native_session_id: session.native_session_id.clone(),
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            provider_sort_key(a.provider)
+                .cmp(&provider_sort_key(b.provider))
+                .then_with(|| a.native_session_id.cmp(&b.native_session_id))
+        });
+
+        let confidence = match sessions.len() {
+            1 => AttributionConfidence::Strong,
+            2.. => AttributionConfidence::Ambiguous,
+            _ => AttributionConfidence::Unknown,
+        };
+
+        if confidence != AttributionConfidence::Unknown {
+            return FileAttribution {
+                confidence,
+                sessions,
+                static_agent_name: None,
+                attributed_at,
+            };
+        }
+
+        let static_agent_name =
+            agent_config::resolve_explicit_assignment(&self.agent_config, workspace);
+        FileAttribution {
+            confidence: if static_agent_name.is_some() {
+                AttributionConfidence::StaticFallback
+            } else {
+                AttributionConfidence::Unknown
+            },
+            sessions,
+            static_agent_name,
+            attributed_at,
+        }
     }
 
     fn handle_analysis_complete(
@@ -489,6 +855,176 @@ impl DaemonState {
         info!("worker channel attached to state actor");
     }
 
+    /// Apply a batch of session updates to the registry.
+    ///
+    /// Each update is upserted individually.  Sessions not present in the batch
+    /// are never modified — polling snapshots therefore cannot accidentally mark
+    /// sessions as `Stopped`.
+    fn handle_agent_session_updates(&mut self, updates: Vec<SessionUpdate>) {
+        let count = updates.len();
+        for update in updates {
+            if update.provider == AgentProvider::Codex
+                && self
+                    .session_registry
+                    .get(update.provider, &update.native_session_id)
+                    .is_some_and(|s| update.updated_at.is_some_and(|t| t < s.updated_at))
+            {
+                continue;
+            }
+            self.session_registry.upsert(update);
+        }
+        debug!(count, "applied agent session updates");
+    }
+
+    /// Apply a single event-stream event to the session registry.
+    ///
+    /// Behaviour per [`EventKind`]:
+    ///
+    /// | Kind | Action |
+    /// |---|---|
+    /// | `ServerConnected` | no-op |
+    /// | `SessionCreated` | upsert with `EventStream` discovery source |
+    /// | `SessionUpdated` | update only if session exists; preserve incomplete |
+    /// | `MessagePartUpdated` | map status → lifecycle, update `last_seen_at` |
+    /// | `MessageUpdated` | update `last_seen_at` only |
+    /// | `SessionCompacted` | set `compacted = true`; preserve lifecycle |
+    /// | `SessionDeleted` | set lifecycle to `Stopped` |
+    ///
+    /// Events without a session ID are silently ignored.
+    fn handle_agent_session_event(&mut self, event: AgentEvent) {
+        let native_session_id = match event.native_session_id {
+            Some(ref id) if !id.is_empty() => id.clone(),
+            _ => return,
+        };
+
+        match event.event_kind {
+            EventKind::ServerConnected => {}
+            EventKind::SessionCreated => {
+                let directory = match event.directory {
+                    Some(d) if !d.as_os_str().is_empty() => d,
+                    None => return,
+                    Some(_) => return,
+                };
+                self.session_registry.upsert(SessionUpdate {
+                    provider: event.provider,
+                    native_session_id,
+                    parent_native_session_id: event.parent_native_session_id,
+                    agent_role: event.agent_role,
+                    directory,
+                    lifecycle: event.lifecycle.unwrap_or(SessionLifecycle::Discovered),
+                    discovery_source: DiscoverySource::EventStream,
+                    created_at: event.timestamp,
+                    updated_at: event.timestamp,
+                });
+            }
+            EventKind::SessionUpdated => {
+                let existing = match self
+                    .session_registry
+                    .get(event.provider, &native_session_id)
+                {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                self.session_registry.upsert(SessionUpdate {
+                    provider: event.provider,
+                    native_session_id,
+                    parent_native_session_id: event
+                        .parent_native_session_id
+                        .or(existing.parent_native_session_id),
+                    agent_role: event.agent_role.or(existing.agent_role),
+                    directory: event.directory.unwrap_or(existing.directory),
+                    lifecycle: event.lifecycle.unwrap_or(existing.lifecycle),
+                    discovery_source: existing.discovery_source,
+                    created_at: None,
+                    updated_at: event.timestamp,
+                });
+            }
+            EventKind::MessagePartUpdated => {
+                let existing = match self
+                    .session_registry
+                    .get(event.provider, &native_session_id)
+                {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                let lifecycle = event.lifecycle.unwrap_or(existing.lifecycle);
+                self.session_registry.upsert(SessionUpdate {
+                    provider: event.provider,
+                    native_session_id,
+                    parent_native_session_id: existing.parent_native_session_id,
+                    agent_role: existing.agent_role,
+                    directory: event.directory.unwrap_or(existing.directory),
+                    lifecycle,
+                    discovery_source: existing.discovery_source,
+                    created_at: None,
+                    updated_at: event.timestamp,
+                });
+            }
+            EventKind::MessageUpdated => {
+                let existing = match self
+                    .session_registry
+                    .get(event.provider, &native_session_id)
+                {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                self.session_registry.upsert(SessionUpdate {
+                    provider: event.provider,
+                    native_session_id,
+                    parent_native_session_id: existing.parent_native_session_id,
+                    agent_role: existing.agent_role,
+                    directory: existing.directory,
+                    lifecycle: event.lifecycle.unwrap_or(existing.lifecycle),
+                    discovery_source: existing.discovery_source,
+                    created_at: None,
+                    updated_at: event.timestamp,
+                });
+            }
+            EventKind::SessionCompacted => {
+                let existing = match self
+                    .session_registry
+                    .get(event.provider, &native_session_id)
+                {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                let sid = native_session_id.clone();
+                self.session_registry.upsert(SessionUpdate {
+                    provider: event.provider,
+                    native_session_id,
+                    parent_native_session_id: existing.parent_native_session_id,
+                    agent_role: existing.agent_role,
+                    directory: existing.directory,
+                    lifecycle: existing.lifecycle,
+                    discovery_source: existing.discovery_source,
+                    created_at: None,
+                    updated_at: event.timestamp,
+                });
+                self.session_registry.compact(event.provider, &sid);
+            }
+            EventKind::SessionDeleted => {
+                let existing = match self
+                    .session_registry
+                    .get(event.provider, &native_session_id)
+                {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                self.session_registry.upsert(SessionUpdate {
+                    provider: event.provider,
+                    native_session_id,
+                    parent_native_session_id: existing.parent_native_session_id,
+                    agent_role: existing.agent_role,
+                    directory: existing.directory,
+                    lifecycle: SessionLifecycle::Stopped,
+                    discovery_source: existing.discovery_source,
+                    created_at: None,
+                    updated_at: event.timestamp,
+                });
+            }
+        }
+    }
+
     fn handle_query(&mut self, request: QueryRequest, reply: oneshot::Sender<QueryResponse>) {
         match request {
             QueryRequest::ListWorkspaces => {
@@ -528,6 +1064,70 @@ impl DaemonState {
             QueryRequest::AwaitAnalysis { timeout_ms } => {
                 self.handle_await_analysis_query(timeout_ms, reply);
             }
+            QueryRequest::GetFileActivity {
+                workspace_id,
+                limit,
+            } => {
+                let mut all = Vec::new();
+                match workspace_id {
+                    Some(wid) => {
+                        if let Some(per_ws) = self.file_activity.get(&wid) {
+                            all.extend(per_ws.values().cloned());
+                        }
+                    }
+                    None => {
+                        for per_ws in self.file_activity.values() {
+                            all.extend(per_ws.values().cloned());
+                        }
+                    }
+                }
+                all.sort_by_key(|a| Reverse(a.last_changed_at));
+                if let Some(limit) = limit {
+                    all.truncate(limit);
+                }
+                Self::send_query_reply(reply, QueryResponse::FileActivity(all));
+            }
+            QueryRequest::GetAgentAssignments => {
+                let workspaces: Vec<Workspace> = self.workspaces.values().cloned().collect();
+                let assignments =
+                    agent_config::resolve_assignments(&self.agent_config, &workspaces);
+                Self::send_query_reply(reply, QueryResponse::AgentAssignments(assignments));
+            }
+            QueryRequest::GetAgentSessions {
+                provider,
+                workspace_id,
+                lifecycle,
+            } => {
+                let mut sessions: Vec<AgentSession> = self
+                    .session_registry
+                    .all()
+                    .into_iter()
+                    .filter(|s| {
+                        if let Some(ref p) = provider {
+                            s.provider == *p
+                        } else {
+                            true
+                        }
+                    })
+                    .filter(|s| {
+                        if let Some(ref wid) = workspace_id {
+                            s.workspace_id == Some(*wid)
+                        } else {
+                            true
+                        }
+                    })
+                    .filter(|s| {
+                        if let Some(ref lc) = lifecycle {
+                            s.lifecycle == *lc
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                sessions.sort_by_key(|s| Reverse(s.updated_at));
+                Self::send_query_reply(reply, QueryResponse::AgentSessions(sessions));
+            }
         }
     }
 
@@ -548,7 +1148,10 @@ impl DaemonState {
             | QueryRequest::GetWorkspace { .. }
             | QueryRequest::GetPairAnalysis { .. }
             | QueryRequest::GetAllAnalyses
-            | QueryRequest::GetStatus => {
+            | QueryRequest::GetStatus
+            | QueryRequest::GetFileActivity { .. }
+            | QueryRequest::GetAgentAssignments
+            | QueryRequest::GetAgentSessions { .. } => {
                 self.handle_query(request, reply);
             }
         }
@@ -665,6 +1268,8 @@ impl DaemonState {
                 return Err(format!("persistence error: {e}"));
             }
             self.workspaces.insert(id, workspace);
+            self.sync_session_registry_workspace_paths();
+            self.session_registry.rebind_all_sessions();
             return Ok(());
         }
 
@@ -696,6 +1301,8 @@ impl DaemonState {
             branch: workspace.branch.clone(),
         };
         self.workspaces.insert(id, workspace);
+        self.sync_session_registry_workspace_paths();
+        self.session_registry.rebind_all_sessions();
         self.emit_event(event);
         Ok(())
     }
@@ -710,6 +1317,7 @@ impl DaemonState {
         info!(workspace_id = %workspace_id, "removing workspace");
 
         self.workspace_overlays.remove(&workspace_id);
+        self.file_activity.remove(&workspace_id);
         self.dirty_workspaces.retain(|id| *id != workspace_id);
 
         // Remove all pair analyses involving this workspace
@@ -724,6 +1332,8 @@ impl DaemonState {
             error!(error = %e, "failed to delete workspace from db");
         }
 
+        self.sync_session_registry_workspace_paths();
+        self.session_registry.rebind_all_sessions();
         self.emit_event(DaemonEvent::WorkspaceRemoved { workspace_id });
         Ok(())
     }
@@ -977,6 +1587,19 @@ impl DaemonState {
         Ok(())
     }
 
+    // ── Workspace path synchronisation ─────────────────────────────────
+
+    /// Copy the current workspace paths into the session registry's workspace
+    /// path index so that [`rebind_all_sessions`] produces correct bindings.
+    fn sync_session_registry_workspace_paths(&mut self) {
+        let paths: HashMap<WorkspaceId, PathBuf> = self
+            .workspaces
+            .iter()
+            .map(|(id, ws)| (*id, ws.path.clone()))
+            .collect();
+        self.session_registry.set_workspace_paths(paths);
+    }
+
     // === Accessors (for testing) ===
 
     pub fn workspace_count(&self) -> usize {
@@ -993,6 +1616,19 @@ impl DaemonState {
 
     pub fn dirty_workspaces(&self) -> &[WorkspaceId] {
         &self.dirty_workspaces
+    }
+
+    pub fn session_registry(&self) -> &AgentSessionRegistry {
+        &self.session_registry
+    }
+}
+
+fn provider_sort_key(provider: AgentProvider) -> u8 {
+    match provider {
+        AgentProvider::OpenCode => 0,
+        AgentProvider::ClaudeCode => 1,
+        AgentProvider::Codex => 2,
+        AgentProvider::Unknown => 3,
     }
 }
 
@@ -2212,5 +2848,1394 @@ mod tests {
 
         tx.send(StateMessage::Shutdown).await.unwrap();
         handle.await.unwrap();
+    }
+
+    // ── File activity tracking ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_activity_absolute_path_becomes_relative() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let ws_activity = state.file_activity.get(&ws_id).unwrap();
+        assert_eq!(ws_activity.len(), 1);
+        let entry = ws_activity.get(&PathBuf::from("src/lib.rs")).unwrap();
+        assert_eq!(entry.workspace_id, ws_id);
+        assert_eq!(entry.relative_path, PathBuf::from("src/lib.rs"));
+        assert_eq!(entry.change_count, 1);
+    }
+
+    #[tokio::test]
+    async fn file_activity_without_session_or_static_mapping_has_unknown_attribution() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-unknown");
+        let ws = make_workspace_at_path("unknown", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let entry = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap();
+        assert_eq!(
+            entry.attribution.confidence,
+            grove_lib::AttributionConfidence::Unknown
+        );
+        assert!(entry.attribution.sessions.is_empty());
+        assert_eq!(entry.attribution.static_agent_name, None);
+    }
+
+    #[tokio::test]
+    async fn file_activity_with_one_active_session_has_strong_attribution() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-strong");
+        let ws = make_workspace_at_path("strong", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+        upsert_dummy(
+            &mut state,
+            "session-strong",
+            root.to_str().unwrap(),
+            SessionLifecycle::Active,
+        );
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let attribution = &state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap()
+            .attribution;
+        assert_eq!(
+            attribution.confidence,
+            grove_lib::AttributionConfidence::Strong
+        );
+        assert_eq!(attribution.sessions.len(), 1);
+        assert_eq!(
+            attribution.sessions[0].provider,
+            grove_lib::AgentProvider::OpenCode
+        );
+        assert_eq!(attribution.sessions[0].native_session_id, "session-strong");
+    }
+
+    #[tokio::test]
+    async fn file_activity_with_multiple_active_sessions_has_ambiguous_attribution() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-ambiguous");
+        let ws = make_workspace_at_path("ambiguous", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+        upsert_dummy(
+            &mut state,
+            "session-b",
+            root.to_str().unwrap(),
+            SessionLifecycle::Active,
+        );
+        state.session_registry.upsert(SessionUpdate {
+            provider: AgentProvider::Codex,
+            native_session_id: "session-a".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: root.clone(),
+            lifecycle: SessionLifecycle::Active,
+            discovery_source: DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let attribution = &state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap()
+            .attribution;
+        assert_eq!(
+            attribution.confidence,
+            grove_lib::AttributionConfidence::Ambiguous
+        );
+        assert_eq!(attribution.sessions.len(), 2);
+        assert_eq!(attribution.sessions[0].provider, AgentProvider::OpenCode);
+        assert_eq!(attribution.sessions[1].provider, AgentProvider::Codex);
+    }
+
+    #[tokio::test]
+    async fn file_activity_ignores_non_active_sessions_during_correlation() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-mixed");
+        let ws = make_workspace_at_path("mixed", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+        upsert_dummy(
+            &mut state,
+            "session-active",
+            root.to_str().unwrap(),
+            SessionLifecycle::Active,
+        );
+        state.session_registry.upsert(SessionUpdate {
+            provider: AgentProvider::Codex,
+            native_session_id: "session-idle".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: root.clone(),
+            lifecycle: SessionLifecycle::Idle,
+            discovery_source: DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let attribution = &state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap()
+            .attribution;
+        assert_eq!(
+            attribution.confidence,
+            grove_lib::AttributionConfidence::Strong
+        );
+        assert_eq!(attribution.sessions.len(), 1);
+        assert_eq!(attribution.sessions[0].native_session_id, "session-active");
+    }
+
+    #[tokio::test]
+    async fn file_activity_uses_explicit_static_mapping_when_no_session_is_active() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-static");
+        let ws = make_workspace_at_path("static", "feature/static", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+        state.agent_config = Some(AgentsConfig {
+            agents: vec![crate::agent_config::AgentEntry {
+                name: "configured-agent".to_string(),
+                path: None,
+                branch: Some("feature/static".to_string()),
+                branch_pattern: None,
+                worktree_pattern: None,
+            }],
+        });
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+
+        let attribution = &state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap()
+            .attribution;
+        assert_eq!(
+            attribution.confidence,
+            grove_lib::AttributionConfidence::StaticFallback
+        );
+        assert_eq!(
+            attribution.static_agent_name.as_deref(),
+            Some("configured-agent")
+        );
+        assert!(attribution.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_file_activity_recomputes_latest_attribution() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-latest");
+        let ws = make_workspace_at_path("latest", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+        let path = root.join("src/lib.rs");
+
+        state.handle_file_changed(ws_id, &path).await;
+        upsert_dummy(
+            &mut state,
+            "session-latest",
+            root.to_str().unwrap(),
+            SessionLifecycle::Active,
+        );
+        state.handle_file_changed(ws_id, &path).await;
+
+        let entry = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap();
+        assert_eq!(entry.change_count, 2);
+        assert_eq!(
+            entry.attribution.confidence,
+            grove_lib::AttributionConfidence::Strong
+        );
+        assert_eq!(
+            entry.attribution.sessions[0].native_session_id,
+            "session-latest"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_activity_outside_worktree_is_rejected() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root);
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &PathBuf::from("/other/path/file.rs"))
+            .await;
+
+        assert!(state.file_activity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_activity_repeated_writes_update_one_record() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let path = root.join("src/lib.rs");
+        state.handle_file_changed(ws_id, &path).await;
+        state.handle_file_changed(ws_id, &path).await;
+
+        let ws_activity = state.file_activity.get(&ws_id).unwrap();
+        assert_eq!(ws_activity.len(), 1);
+        let entry = ws_activity.get(&PathBuf::from("src/lib.rs")).unwrap();
+        assert_eq!(entry.change_count, 2);
+    }
+
+    #[tokio::test]
+    async fn file_activity_timestamps_on_repeated_writes() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let path = root.join("src/lib.rs");
+        state.handle_file_changed(ws_id, &path).await;
+        let entry_after_first = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap()
+            .clone();
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        state.handle_file_changed(ws_id, &path).await;
+        let entry = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap();
+
+        assert_eq!(entry.first_changed_at, entry_after_first.first_changed_at);
+        assert!(
+            entry.last_changed_at > entry.first_changed_at,
+            "last_changed_at ({last}) should be later than first_changed_at ({first})",
+            last = entry.last_changed_at,
+            first = entry.first_changed_at,
+        );
+        assert_eq!(entry.change_count, 2);
+    }
+
+    #[tokio::test]
+    async fn file_activity_change_count_increments() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let path = root.join("src/lib.rs");
+        for _ in 0..5 {
+            state.handle_file_changed(ws_id, &path).await;
+        }
+
+        let entry = state
+            .file_activity
+            .get(&ws_id)
+            .unwrap()
+            .get(&PathBuf::from("src/lib.rs"))
+            .unwrap();
+        assert_eq!(entry.change_count, 5);
+    }
+
+    #[tokio::test]
+    async fn file_activity_identical_relative_paths_in_separate_worktrees() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root_a = PathBuf::from("/tmp/worktree-a");
+        let root_b = PathBuf::from("/tmp/worktree-b");
+        let ws_a = make_workspace_at_path("a", "main", root_a.clone());
+        let ws_b = make_workspace_at_path("b", "main", root_b.clone());
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+        state.handle_register_workspace(ws_a).unwrap();
+        state.handle_register_workspace(ws_b).unwrap();
+
+        state
+            .handle_file_changed(id_a, &root_a.join("src/lib.rs"))
+            .await;
+        state
+            .handle_file_changed(id_b, &root_b.join("src/lib.rs"))
+            .await;
+
+        let a_activity = state.file_activity.get(&id_a).unwrap();
+        let b_activity = state.file_activity.get(&id_b).unwrap();
+        assert_eq!(a_activity.len(), 1);
+        assert_eq!(b_activity.len(), 1);
+        // Both have the same relative path but under different workspace IDs
+        assert_eq!(
+            a_activity
+                .get(&PathBuf::from("src/lib.rs"))
+                .unwrap()
+                .workspace_id,
+            id_a
+        );
+        assert_eq!(
+            b_activity
+                .get(&PathBuf::from("src/lib.rs"))
+                .unwrap()
+                .workspace_id,
+            id_b
+        );
+    }
+
+    #[tokio::test]
+    async fn file_activity_unknown_workspace_rejected() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state
+            .handle_file_changed(Uuid::new_v4(), &PathBuf::from("/some/path/file.rs"))
+            .await;
+        assert!(state.file_activity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_activity_worktree_root_not_stored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        // Send the worktree root itself as the changed path
+        state.handle_file_changed(ws_id, &root).await;
+
+        assert!(state.file_activity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_activity_removing_workspace_clears_activity() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root = PathBuf::from("/tmp/worktree-a");
+        let ws = make_workspace_at_path("a", "main", root.clone());
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state
+            .handle_file_changed(ws_id, &root.join("src/lib.rs"))
+            .await;
+        assert!(state.file_activity.contains_key(&ws_id));
+
+        state.handle_remove_workspace(ws_id).unwrap();
+        assert!(!state.file_activity.contains_key(&ws_id));
+    }
+
+    // ── File activity query ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_file_activity_query_returns_flattened_sorted_results() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let root_a = PathBuf::from("/tmp/worktree-a");
+        let root_b = PathBuf::from("/tmp/worktree-b");
+        let ws_a = make_workspace_at_path("a", "main", root_a.clone());
+        let ws_b = make_workspace_at_path("b", "main", root_b.clone());
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+        state.handle_register_workspace(ws_a).unwrap();
+        state.handle_register_workspace(ws_b).unwrap();
+
+        state
+            .handle_file_changed(id_a, &root_a.join("src/a.rs"))
+            .await;
+        state
+            .handle_file_changed(id_b, &root_b.join("src/b.rs"))
+            .await;
+        state
+            .handle_file_changed(id_a, &root_a.join("src/a2.rs"))
+            .await;
+
+        // Query all — should get 3 entries sorted newest first
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(
+            QueryRequest::GetFileActivity {
+                workspace_id: None,
+                limit: None,
+            },
+            reply_tx,
+        );
+        let result = reply_rx.await.unwrap();
+        let activities = match result {
+            QueryResponse::FileActivity(a) => a,
+            other => panic!("expected FileActivity, got: {other:?}"),
+        };
+        assert_eq!(activities.len(), 3);
+
+        // Query filtered by workspace
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(
+            QueryRequest::GetFileActivity {
+                workspace_id: Some(id_a),
+                limit: None,
+            },
+            reply_tx,
+        );
+        let result = reply_rx.await.unwrap();
+        let activities = match result {
+            QueryResponse::FileActivity(a) => a,
+            other => panic!("expected FileActivity, got: {other:?}"),
+        };
+        assert_eq!(activities.len(), 2);
+        assert!(activities.iter().all(|a| a.workspace_id == id_a));
+
+        // Query with limit
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(
+            QueryRequest::GetFileActivity {
+                workspace_id: None,
+                limit: Some(1),
+            },
+            reply_tx,
+        );
+        let result = reply_rx.await.unwrap();
+        let activities = match result {
+            QueryResponse::FileActivity(a) => a,
+            other => panic!("expected FileActivity, got: {other:?}"),
+        };
+        assert_eq!(activities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_agent_assignments_query_returns_fallback_names() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let ws = make_workspace("test-ws");
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state.handle_query(QueryRequest::GetAgentAssignments, reply_tx);
+        let result = reply_rx.await.unwrap();
+        let assignments = match result {
+            QueryResponse::AgentAssignments(a) => a,
+            other => panic!("expected AgentAssignments, got: {other:?}"),
+        };
+        assert_eq!(assignments.len(), 1);
+        // Without agents.toml, fallback to workspace name
+        assert_eq!(assignments[0].workspace_id, ws_id);
+        assert_eq!(assignments[0].agent_name, "test-ws");
+    }
+
+    // ── Agent session registry integration ─────────────────────────────────
+
+    #[tokio::test]
+    async fn agent_session_updates_reach_registry() {
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let updates = vec![
+            SessionUpdate {
+                provider: grove_lib::AgentProvider::OpenCode,
+                native_session_id: "ses-1".to_string(),
+                parent_native_session_id: None,
+                agent_role: None,
+                directory: PathBuf::from("/tmp/ws"),
+                lifecycle: grove_lib::SessionLifecycle::Active,
+                discovery_source: grove_lib::DiscoverySource::ProcessScan,
+                created_at: None,
+                updated_at: None,
+            },
+            SessionUpdate {
+                provider: grove_lib::AgentProvider::ClaudeCode,
+                native_session_id: "ses-2".to_string(),
+                parent_native_session_id: None,
+                agent_role: None,
+                directory: PathBuf::from("/tmp/ws"),
+                lifecycle: grove_lib::SessionLifecycle::Discovered,
+                discovery_source: grove_lib::DiscoverySource::ApiPoll,
+                created_at: None,
+                updated_at: None,
+            },
+        ];
+
+        tx.send(StateMessage::AgentSessionUpdates { updates })
+            .await
+            .unwrap();
+
+        // Query to ensure actor processed the message
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_session_updates_remain_one_session() {
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        fn make_update(native_id: &str, lifecycle: grove_lib::SessionLifecycle) -> SessionUpdate {
+            SessionUpdate {
+                provider: grove_lib::AgentProvider::OpenCode,
+                native_session_id: native_id.to_string(),
+                parent_native_session_id: None,
+                agent_role: None,
+                directory: PathBuf::from("/tmp/ws"),
+                lifecycle,
+                discovery_source: grove_lib::DiscoverySource::ProcessScan,
+                created_at: None,
+                updated_at: None,
+            }
+        }
+
+        // First update: Active
+        tx.send(StateMessage::AgentSessionUpdates {
+            updates: vec![make_update("ses-1", grove_lib::SessionLifecycle::Active)],
+        })
+        .await
+        .unwrap();
+
+        // Second update: Idle — same session
+        tx.send(StateMessage::AgentSessionUpdates {
+            updates: vec![make_update("ses-1", grove_lib::SessionLifecycle::Idle)],
+        })
+        .await
+        .unwrap();
+
+        // Query to drain
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    // ── Agent session event tests ─────────────────────────────────────────
+
+    fn make_event(
+        kind: EventKind,
+        session_id: Option<&str>,
+        parent_id: Option<&str>,
+        directory: Option<&str>,
+        lifecycle: Option<SessionLifecycle>,
+        agent_role: Option<&str>,
+        timestamp: Option<i64>,
+    ) -> AgentEvent {
+        AgentEvent {
+            provider: AgentProvider::OpenCode,
+            native_session_id: session_id.map(|s| s.to_string()),
+            parent_native_session_id: parent_id.map(|s| s.to_string()),
+            event_kind: kind,
+            timestamp: timestamp.and_then(chrono::DateTime::from_timestamp_millis),
+            lifecycle,
+            agent_role: agent_role.map(|s| s.to_string()),
+            directory: directory.map(PathBuf::from),
+            compacted: false,
+        }
+    }
+
+    fn upsert_dummy(state: &mut DaemonState, id: &str, dir: &str, lifecycle: SessionLifecycle) {
+        state.session_registry.upsert(SessionUpdate {
+            provider: AgentProvider::OpenCode,
+            native_session_id: id.to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from(dir),
+            lifecycle,
+            discovery_source: DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+    }
+
+    #[test]
+    fn server_connected_is_noop() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state.handle_agent_session_event(make_event(
+            EventKind::ServerConnected,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+    }
+
+    #[test]
+    fn event_without_session_id_is_ignored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        // Every event kind that would otherwise do something
+        for kind in &[
+            EventKind::ServerConnected,
+            EventKind::SessionCreated,
+            EventKind::SessionUpdated,
+            EventKind::MessagePartUpdated,
+            EventKind::MessageUpdated,
+            EventKind::SessionCompacted,
+            EventKind::SessionDeleted,
+        ] {
+            state.handle_agent_session_event(make_event(
+                kind.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        assert!(state.session_registry().is_empty());
+    }
+
+    #[test]
+    fn session_created_without_directory_is_ignored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("ses-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+    }
+
+    #[test]
+    fn session_created_with_empty_directory_is_ignored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("ses-1"),
+            None,
+            Some(""),
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+    }
+
+    #[test]
+    fn session_created_without_explicit_lifecycle_is_discovered() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("ses-1"),
+            None,
+            Some("/tmp/ws"),
+            None,
+            None,
+            None,
+        ));
+
+        let session = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert_eq!(session.lifecycle, SessionLifecycle::Discovered);
+    }
+
+    #[test]
+    fn session_created_creates_session() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("ses-1"),
+            Some("parent-1"),
+            Some("/tmp/ws"),
+            Some(SessionLifecycle::Active),
+            Some("opencode"),
+            Some(1718455200000),
+        ));
+
+        let s = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .expect("session should exist");
+        assert_eq!(s.parent_native_session_id.as_deref(), Some("parent-1"));
+        assert_eq!(s.agent_role.as_deref(), Some("opencode"));
+        assert_eq!(s.directory, PathBuf::from("/tmp/ws"));
+        assert_eq!(s.lifecycle, SessionLifecycle::Active);
+        assert_eq!(s.discovery_source, DiscoverySource::EventStream);
+        assert!(s.created_at.timestamp_millis() == 1718455200000);
+    }
+
+    #[test]
+    fn partial_event_for_unknown_session_ignored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        // session.updated without existing session
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionUpdated,
+            Some("ses-unknown"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+
+        // message.part.updated without existing session
+        state.handle_agent_session_event(make_event(
+            EventKind::MessagePartUpdated,
+            Some("ses-unknown"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+
+        // message.updated without existing session
+        state.handle_agent_session_event(make_event(
+            EventKind::MessageUpdated,
+            Some("ses-unknown"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+
+        // session.deleted without existing session
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionDeleted,
+            Some("ses-unknown"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(state.session_registry().is_empty());
+    }
+
+    #[test]
+    fn session_created_then_active_and_idle_transitions() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        // Create as Active
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("ses-1"),
+            None,
+            Some("/tmp/ws"),
+            Some(SessionLifecycle::Active),
+            None,
+            Some(1000),
+        ));
+        assert_eq!(
+            state
+                .session_registry()
+                .get(AgentProvider::OpenCode, "ses-1")
+                .unwrap()
+                .lifecycle,
+            SessionLifecycle::Active
+        );
+
+        // message.part.updated with completed → Idle
+        state.handle_agent_session_event(make_event(
+            EventKind::MessagePartUpdated,
+            Some("ses-1"),
+            None,
+            None,
+            Some(SessionLifecycle::Idle),
+            None,
+            Some(2000),
+        ));
+        assert_eq!(
+            state
+                .session_registry()
+                .get(AgentProvider::OpenCode, "ses-1")
+                .unwrap()
+                .lifecycle,
+            SessionLifecycle::Idle
+        );
+
+        // message.part.updated with running → Active
+        state.handle_agent_session_event(make_event(
+            EventKind::MessagePartUpdated,
+            Some("ses-1"),
+            None,
+            None,
+            Some(SessionLifecycle::Active),
+            None,
+            Some(3000),
+        ));
+        assert_eq!(
+            state
+                .session_registry()
+                .get(AgentProvider::OpenCode, "ses-1")
+                .unwrap()
+                .lifecycle,
+            SessionLifecycle::Active
+        );
+    }
+
+    #[test]
+    fn compacted_preserves_lifecycle() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        upsert_dummy(&mut state, "ses-1", "/tmp/ws", SessionLifecycle::Active);
+
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCompacted,
+            Some("ses-1"),
+            None,
+            None,
+            None,
+            None,
+            Some(1000),
+        ));
+
+        let s = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert!(s.compacted);
+        assert_eq!(s.lifecycle, SessionLifecycle::Active);
+    }
+
+    #[test]
+    fn deleted_becomes_stopped() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        upsert_dummy(&mut state, "ses-1", "/tmp/ws", SessionLifecycle::Active);
+
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionDeleted,
+            Some("ses-1"),
+            None,
+            None,
+            None,
+            None,
+            Some(1000),
+        ));
+
+        let s = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert_eq!(s.lifecycle, SessionLifecycle::Stopped);
+        // Still in registry
+        assert_eq!(state.session_registry().len(), 1);
+    }
+
+    #[test]
+    fn parent_child_metadata_preserved() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        // Create child with parent
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("child-1"),
+            Some("parent-1"),
+            Some("/tmp/ws"),
+            Some(SessionLifecycle::Active),
+            Some("opencode"),
+            Some(1000),
+        ));
+
+        // Session updated should preserve parent and role
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionUpdated,
+            Some("child-1"),
+            None,
+            None,
+            None,
+            None,
+            Some(2000),
+        ));
+
+        let s = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "child-1")
+            .unwrap();
+        assert_eq!(s.parent_native_session_id.as_deref(), Some("parent-1"));
+        assert_eq!(s.agent_role.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn workspace_binding_preserved_during_event_updates() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        // Register a workspace
+        let ws = make_workspace_at_path("project", "main", PathBuf::from("/home/user/project"));
+        state.handle_register_workspace(ws).unwrap();
+
+        // Create a session inside that workspace
+        state.handle_agent_session_event(make_event(
+            EventKind::SessionCreated,
+            Some("ses-1"),
+            None,
+            Some("/home/user/project/src"),
+            Some(SessionLifecycle::Active),
+            None,
+            Some(1000),
+        ));
+
+        let ws_id = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap()
+            .workspace_id;
+        assert!(
+            ws_id.is_some(),
+            "workspace_id should be bound after creation"
+        );
+
+        // An event update must not unbind it
+        state.handle_agent_session_event(make_event(
+            EventKind::MessagePartUpdated,
+            Some("ses-1"),
+            None,
+            None,
+            Some(SessionLifecycle::Idle),
+            None,
+            Some(2000),
+        ));
+
+        let ws_id_after = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap()
+            .workspace_id;
+        assert_eq!(ws_id_after, ws_id, "workspace binding must survive updates");
+    }
+
+    #[test]
+    fn message_updated_preserves_metadata() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        upsert_dummy(&mut state, "ses-1", "/tmp/ws", SessionLifecycle::Active);
+
+        state.handle_agent_session_event(make_event(
+            EventKind::MessageUpdated,
+            Some("ses-1"),
+            None,
+            None,
+            None,
+            None,
+            Some(1000),
+        ));
+
+        let s = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert_eq!(s.directory, PathBuf::from("/tmp/ws"));
+        assert_eq!(s.lifecycle, SessionLifecycle::Active);
+    }
+
+    #[test]
+    fn message_updated_applies_explicit_normalized_lifecycle_transition() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        upsert_dummy(&mut state, "ses-1", "/tmp/ws", SessionLifecycle::Active);
+
+        state.handle_agent_session_event(make_event(
+            EventKind::MessageUpdated,
+            Some("ses-1"),
+            None,
+            None,
+            Some(SessionLifecycle::Idle),
+            None,
+            Some(1000),
+        ));
+
+        let session = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert_eq!(session.lifecycle, SessionLifecycle::Idle);
+    }
+
+    #[test]
+    fn unknown_part_status_preserves_lifecycle() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        upsert_dummy(&mut state, "ses-1", "/tmp/ws", SessionLifecycle::Active);
+
+        // message.part.updated with None lifecycle (unknown status)
+        state.handle_agent_session_event(make_event(
+            EventKind::MessagePartUpdated,
+            Some("ses-1"),
+            None,
+            None,
+            None,
+            None,
+            Some(1000),
+        ));
+
+        let s = state
+            .session_registry()
+            .get(AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert_eq!(s.lifecycle, SessionLifecycle::Active);
+    }
+
+    // ── Direct state access tests (no actor) ───────────────────────────────
+
+    #[test]
+    fn workspace_registration_binds_existing_session() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        // Upsert a session before any workspace is registered — no binding.
+        state.session_registry.upsert(SessionUpdate {
+            provider: grove_lib::AgentProvider::OpenCode,
+            native_session_id: "ses-1".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from("/home/user/project/src"),
+            lifecycle: grove_lib::SessionLifecycle::Active,
+            discovery_source: grove_lib::DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+
+        // Session should be unbound initially
+        assert!(
+            state
+                .session_registry()
+                .get(grove_lib::AgentProvider::OpenCode, "ses-1")
+                .unwrap()
+                .workspace_id
+                .is_none()
+        );
+
+        // Register a workspace whose path covers the session's directory
+        let ws = make_workspace_at_path("project", "main", PathBuf::from("/home/user/project"));
+        state.handle_register_workspace(ws).unwrap();
+
+        // Session should now be bound
+        let session = state
+            .session_registry()
+            .get(grove_lib::AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert!(session.workspace_id.is_some());
+    }
+
+    #[test]
+    fn workspace_removal_unbinds_session_without_deleting_it() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        // Register a workspace first
+        let ws = make_workspace_at_path("project", "main", PathBuf::from("/home/user/project"));
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        // Upsert a session that binds to this workspace
+        state.session_registry.upsert(SessionUpdate {
+            provider: grove_lib::AgentProvider::OpenCode,
+            native_session_id: "ses-1".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from("/home/user/project/src"),
+            lifecycle: grove_lib::SessionLifecycle::Active,
+            discovery_source: grove_lib::DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+
+        // Confirm it's bound
+        assert!(
+            state
+                .session_registry()
+                .get(grove_lib::AgentProvider::OpenCode, "ses-1")
+                .unwrap()
+                .workspace_id
+                .is_some()
+        );
+
+        // Remove the workspace
+        state.handle_remove_workspace(ws_id).unwrap();
+
+        // Session still exists but is now unbound
+        let session = state
+            .session_registry()
+            .get(grove_lib::AgentProvider::OpenCode, "ses-1")
+            .unwrap();
+        assert!(
+            session.workspace_id.is_none(),
+            "session should be unbound, not deleted"
+        );
+        assert_eq!(session.native_session_id, "ses-1");
+    }
+
+    #[test]
+    fn missing_sessions_in_snapshot_not_marked_stopped() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        // Register a session
+        state.session_registry.upsert(SessionUpdate {
+            provider: grove_lib::AgentProvider::OpenCode,
+            native_session_id: "ses-keep".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from("/tmp/ws"),
+            lifecycle: grove_lib::SessionLifecycle::Active,
+            discovery_source: grove_lib::DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+
+        // Submit a snapshot that does NOT include ses-keep
+        state.handle_agent_session_updates(vec![SessionUpdate {
+            provider: grove_lib::AgentProvider::OpenCode,
+            native_session_id: "ses-other".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from("/tmp/other"),
+            lifecycle: grove_lib::SessionLifecycle::Active,
+            discovery_source: grove_lib::DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        }]);
+
+        // ses-keep must still be Active, not Stopped
+        let session = state
+            .session_registry()
+            .get(grove_lib::AgentProvider::OpenCode, "ses-keep")
+            .unwrap();
+        assert_eq!(
+            session.lifecycle,
+            grove_lib::SessionLifecycle::Active,
+            "session missing from snapshot must not be marked Stopped"
+        );
+        assert_eq!(state.session_registry().len(), 2);
+    }
+
+    #[test]
+    fn registry_size_accessible_after_updates() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+
+        state.session_registry.upsert(SessionUpdate {
+            provider: grove_lib::AgentProvider::OpenCode,
+            native_session_id: "a".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from("/tmp/a"),
+            lifecycle: grove_lib::SessionLifecycle::Active,
+            discovery_source: grove_lib::DiscoverySource::ProcessScan,
+            created_at: None,
+            updated_at: None,
+        });
+        state.session_registry.upsert(SessionUpdate {
+            provider: grove_lib::AgentProvider::ClaudeCode,
+            native_session_id: "b".to_string(),
+            parent_native_session_id: None,
+            agent_role: None,
+            directory: PathBuf::from("/tmp/b"),
+            lifecycle: grove_lib::SessionLifecycle::Discovered,
+            discovery_source: grove_lib::DiscoverySource::ApiPoll,
+            created_at: None,
+            updated_at: None,
+        });
+
+        assert_eq!(state.session_registry().len(), 2);
+    }
+
+    // ── OpenCodeConfig tests ────────────────────────────────────────────────
+
+    /// Evaluate the production parser against independent test values.
+    fn opencode_config(
+        url: Option<&str>,
+        user: Option<&str>,
+        pass: Option<&str>,
+    ) -> Result<Option<OpenCodeConfig>, String> {
+        OpenCodeConfig::from_lookup(|name| {
+            let value = match name {
+                "OPENCODE_SERVER_URL" => url,
+                "OPENCODE_SERVER_USERNAME" => user,
+                "OPENCODE_SERVER_PASSWORD" => pass,
+                _ => None,
+            };
+            value
+                .map(str::to_owned)
+                .ok_or(std::env::VarError::NotPresent)
+        })
+    }
+
+    #[test]
+    fn opencode_config_no_env_vars_disabled() {
+        let result = opencode_config(None, None, None);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn opencode_config_all_vars_configured() {
+        let result = opencode_config(
+            Some("http://localhost:8080"),
+            Some("testuser"),
+            Some("testpass"),
+        );
+        let cfg = result.unwrap().unwrap();
+        assert_eq!(cfg.server_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn opencode_config_url_without_username_errors() {
+        let result = opencode_config(Some("http://localhost:8080"), None, Some("somepass"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("OPENCODE_SERVER_USERNAME"),
+            "error should mention USERNAME, got: {err}"
+        );
+        assert!(!err.contains("somepass"), "error must not leak password");
+    }
+
+    #[test]
+    fn opencode_config_url_without_password_errors() {
+        let result = opencode_config(Some("http://localhost:8080"), Some("someuser"), None);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("OPENCODE_SERVER_PASSWORD"),
+            "error should mention PASSWORD, got: {err}"
+        );
+        assert!(!err.contains("someuser"), "error must not leak username");
+    }
+
+    #[test]
+    fn opencode_config_password_without_username_errors() {
+        let result = opencode_config(Some("http://localhost:8080"), None, Some("secret123"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("OPENCODE_SERVER_USERNAME"),
+            "error should mention USERNAME, got: {err}"
+        );
+        assert!(!err.contains("secret123"), "error must not leak password");
+    }
+
+    #[test]
+    fn opencode_config_rejects_empty_credentials() {
+        let result = opencode_config(Some("http://localhost:8080"), Some("  "), Some("testpass"));
+        let error = result.unwrap_err();
+        assert!(error.contains("OPENCODE_SERVER_USERNAME"));
+        assert!(!error.contains("testpass"));
+
+        let result = opencode_config(Some("http://localhost:8080"), Some("testuser"), Some(""));
+        let error = result.unwrap_err();
+        assert!(error.contains("OPENCODE_SERVER_PASSWORD"));
+        assert!(!error.contains("testuser"));
+    }
+
+    #[test]
+    fn opencode_config_debug_hides_credentials() {
+        let cfg = OpenCodeConfig {
+            server_url: "http://localhost:8080".to_string(),
+            username: "admin".to_string(),
+            password: "supersecret".to_string(),
+        };
+        let debug_str = format!("{cfg:?}");
+        assert!(
+            !debug_str.contains("admin"),
+            "Debug must not contain username: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("supersecret"),
+            "Debug must not contain password: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("***"),
+            "Debug should mask values: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn opencode_config_error_messages_do_not_expose_credentials() {
+        let result = opencode_config(Some("http://localhost:8080"), None, Some("s3cret"));
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("s3cret"),
+            "error must not expose password: {err}"
+        );
+        assert!(
+            !err.contains("localhost"),
+            "error should not contain URL value: {err}"
+        );
+
+        let result = opencode_config(Some("http://localhost:8080"), Some("admin"), None);
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("admin"),
+            "error must not expose username: {err}"
+        );
+        assert!(
+            !err.contains("localhost"),
+            "error should not contain URL value: {err}"
+        );
+    }
+
+    #[test]
+    fn opencode_server_url_validation_rejects_credential_bearing_urls() {
+        assert!(validate_opencode_server_url("http://127.0.0.1:4096").is_ok());
+        assert!(validate_opencode_server_url("https://opencode.local").is_ok());
+
+        for url in [
+            "http://user:pass@127.0.0.1:4096",
+            "http://127.0.0.1:4096?token=secret",
+            "http://127.0.0.1:4096/#secret",
+            "file:///tmp/opencode.sock",
+        ] {
+            let error = validate_opencode_server_url(url).unwrap_err();
+            assert!(!error.contains(url));
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("pass"));
+        }
     }
 }

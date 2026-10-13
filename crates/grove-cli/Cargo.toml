@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rmcp = { workspace = true }
+schemars = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+rusqlite = { workspace = true }
 grove-lib = { path = "../grove-lib" }
 clap = { workspace = true }
 tokio = { workspace = true }

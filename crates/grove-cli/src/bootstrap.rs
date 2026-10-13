@@ -44,11 +44,12 @@ fn repo_to_git_context(repo: &gix::Repository) -> Result<GitContext, String> {
     })
 }
 
-/// Derive the canonical `.grove/` directory from git context.
+/// Shared metadata lives outside every worktree, including the main checkout.
+/// Adapted from CWA's common_git_dir/state_root at 04a8fe944000353ea6baa9715df303e2acac0a92.
+/// Copyright (c) 2026 Pedro Antonio; MIT. See THIRD_PARTY_NOTICES.md.
 pub fn grove_dir_from_context(ctx: &GitContext) -> PathBuf {
-    infer_repo_root_from_common_dir(&ctx.common_dir)
-        .unwrap_or_else(|| ctx.toplevel.clone())
-        .join(".grove")
+    // gix returns the true common directory for linked worktrees.
+    ctx.common_dir.join("grove")
 }
 
 fn infer_repo_root_from_common_dir(common_dir: &Path) -> Option<PathBuf> {
@@ -62,16 +63,24 @@ fn infer_repo_root_from_common_dir(common_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    // Fallback for bare-style common dirs (e.g. /path/repo.git).
-    common_dir.parent().map(Path::to_path_buf)
+    // A bare directory has no unambiguous legacy worktree root.
+    None
 }
 
-/// Ensure `.grove/` directory exists and is excluded from git tracking.
+/// Ensure the shared metadata directory exists and preserve known legacy state.
 pub fn ensure_grove_dir(ctx: &GitContext) -> Result<PathBuf, String> {
     let grove_dir = grove_dir_from_context(ctx);
 
     std::fs::create_dir_all(&grove_dir)
         .map_err(|e| format!("failed to create {}: {e}", grove_dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&grove_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot secure coordination directory: {e}"))?;
+    }
+    preserve_legacy_state(ctx, &grove_dir)?;
 
     // Add .grove/ to git exclude (not .gitignore -- avoids diffs)
     if let Err(e) = add_to_git_exclude(ctx) {
@@ -80,6 +89,59 @@ pub fn ensure_grove_dir(ctx: &GitContext) -> Result<PathBuf, String> {
     }
 
     Ok(grove_dir)
+}
+
+/// Copy a consistent SQLite snapshot once; retain the original directory and
+/// running legacy daemon. Never copy a live DB file without its WAL.
+fn preserve_legacy_state(ctx: &GitContext, destination: &Path) -> Result<(), String> {
+    // Bare metadata has no unambiguous legacy worktree root. The former
+    // parent-directory fallback could alias siblings' .grove stores; retain
+    // those files in place rather than copying unrelated state into this repo.
+    let Some(root) = infer_repo_root_from_common_dir(&ctx.common_dir) else {
+        return Ok(());
+    };
+    let legacy = root.join(".grove");
+    let source = legacy.join("grove.db");
+    let target = destination.join("grove.db");
+    if source.is_file() && !target.exists() {
+        let temporary = destination.join(format!("migration-{}.db", uuid::Uuid::new_v4()));
+        let conn = rusqlite::Connection::open_with_flags(
+            &source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("cannot open legacy Grove database: {e}"))?;
+        conn.backup(rusqlite::MAIN_DB, &temporary, None)
+            .map_err(|e| format!("cannot snapshot legacy Grove database: {e}"))?;
+        // Atomic no-clobber installation also handles concurrent bootstrap.
+        match std::fs::hard_link(&temporary, &target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(format!("cannot preserve legacy database: {e}"));
+            }
+        }
+        let _ = std::fs::remove_file(&temporary);
+    }
+    let config = legacy.join("agents.toml");
+    let dest = destination.join("agents.toml");
+    if config.is_file() && !dest.exists() {
+        use std::io::Write;
+        let content = std::fs::read(&config)
+            .map_err(|e| format!("cannot read legacy agent mappings: {e}"))?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+        {
+            Ok(mut f) => f
+                .write_all(&content)
+                .map_err(|e| format!("cannot preserve legacy mappings: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("cannot preserve legacy mappings: {e}")),
+        }
+    }
+    Ok(())
 }
 
 fn add_to_git_exclude(ctx: &GitContext) -> Result<(), String> {
@@ -313,15 +375,78 @@ mod tests {
     }
 
     #[test]
-    fn grove_dir_is_sibling_of_common_dir() {
+    fn grove_dir_is_inside_common_dir() {
         let ctx = GitContext {
             toplevel: PathBuf::from("/home/user/myproject"),
             common_dir: PathBuf::from("/home/user/myproject/.git"),
         };
         assert_eq!(
             grove_dir_from_context(&ctx),
-            PathBuf::from("/home/user/myproject/.grove")
+            PathBuf::from("/home/user/myproject/.git/grove")
         );
+    }
+
+    #[test]
+    fn legacy_database_backup_preserves_committed_wal_and_never_clobbers_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let common_dir = root.join(".git");
+        let legacy = root.join(".grove");
+        let destination = common_dir.join("grove");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let conn = rusqlite::Connection::open(legacy.join("grove.db")).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE receipt(value TEXT); INSERT INTO receipt VALUES('committed in WAL');").unwrap();
+        std::fs::write(legacy.join("agents.toml"), "# original mapping\n").unwrap();
+        let ctx = GitContext {
+            toplevel: root.clone(),
+            common_dir,
+        };
+        preserve_legacy_state(&ctx, &destination).unwrap();
+        let copy = rusqlite::Connection::open(destination.join("grove.db")).unwrap();
+        assert_eq!(
+            copy.query_row("SELECT value FROM receipt", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "committed in WAL"
+        );
+        copy.execute("UPDATE receipt SET value='new shared state'", [])
+            .unwrap();
+        std::fs::write(destination.join("agents.toml"), "# updated mapping\n").unwrap();
+        preserve_legacy_state(&ctx, &destination).unwrap();
+        assert_eq!(
+            copy.query_row("SELECT value FROM receipt", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "new shared state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("agents.toml")).unwrap(),
+            "# updated mapping\n"
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM receipt", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "committed in WAL"
+        );
+    }
+
+    #[test]
+    fn bare_metadata_never_imports_an_ambiguous_parent_legacy_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_legacy = temp.path().join(".grove");
+        std::fs::create_dir(&parent_legacy).unwrap();
+        std::fs::write(
+            parent_legacy.join("grove.db"),
+            "belongs to an unknown repository",
+        )
+        .unwrap();
+        for name in ["first.git", "second.git"] {
+            let ctx = GitContext {
+                toplevel: temp.path().join(name),
+                common_dir: temp.path().join(name),
+            };
+            let dir = ensure_grove_dir(&ctx).unwrap();
+            assert!(!dir.join("grove.db").exists());
+        }
     }
 
     #[test]
@@ -330,10 +455,10 @@ mod tests {
             toplevel: PathBuf::from("/home/user/myproject"),
             common_dir: PathBuf::from("/home/user/myproject.git"),
         };
-        // Parent of /home/user/myproject.git is /home/user
+        // Bare-style metadata stays scoped to this repository.
         assert_eq!(
             grove_dir_from_context(&ctx),
-            PathBuf::from("/home/user/.grove")
+            PathBuf::from("/home/user/myproject.git/grove")
         );
     }
 
@@ -341,11 +466,11 @@ mod tests {
     fn grove_dir_works_for_linked_worktree_common_dir() {
         let ctx = GitContext {
             toplevel: PathBuf::from("/home/user/myproject/.worktrees/feature-x"),
-            common_dir: PathBuf::from("/home/user/myproject/.git/worktrees/feature-x"),
+            common_dir: PathBuf::from("/home/user/myproject/.git"),
         };
         assert_eq!(
             grove_dir_from_context(&ctx),
-            PathBuf::from("/home/user/myproject/.grove")
+            PathBuf::from("/home/user/myproject/.git/grove")
         );
     }
 
@@ -359,12 +484,9 @@ mod tests {
     }
 
     #[test]
-    fn infer_repo_root_from_common_dir_uses_parent_for_bare_style_path() {
+    fn infer_repo_root_from_common_dir_rejects_ambiguous_bare_style_root() {
         let common = PathBuf::from("/home/user/repo.git");
-        assert_eq!(
-            infer_repo_root_from_common_dir(&common),
-            Some(PathBuf::from("/home/user"))
-        );
+        assert_eq!(infer_repo_root_from_common_dir(&common), None);
     }
 
     #[test]
@@ -447,7 +569,7 @@ mod tests {
         };
 
         let grove_dir = ensure_grove_dir(&ctx).unwrap();
-        assert_eq!(grove_dir, repo_root.join(".grove"));
+        assert_eq!(grove_dir, common_dir.join("grove"));
         assert!(grove_dir.is_dir());
 
         let exclude = std::fs::read_to_string(common_dir.join("info").join("exclude")).unwrap();

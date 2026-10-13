@@ -442,22 +442,20 @@ fn extract_public_declarations(
                     });
                 }
             }
-            "field_declaration" => {
-                if has_public_modifier(child, source) {
-                    let mut fc = child.walk();
-                    for fc_child in child.children(&mut fc) {
-                        if fc_child.kind() == "variable_declaration" {
-                            let mut vc = fc_child.walk();
-                            for vc_child in fc_child.children(&mut vc) {
-                                if vc_child.kind() == "variable_declarator"
-                                    && let Some(name_node) = vc_child.child_by_field_name("name")
-                                {
-                                    exports.push(ExportedSymbol {
-                                        name: name_node.utf8_text(source).unwrap_or("").to_string(),
-                                        kind: SymbolKind::Variable,
-                                        signature: None,
-                                    });
-                                }
+            "field_declaration" if has_public_modifier(child, source) => {
+                let mut fc = child.walk();
+                for fc_child in child.children(&mut fc) {
+                    if fc_child.kind() == "variable_declaration" {
+                        let mut vc = fc_child.walk();
+                        for vc_child in fc_child.children(&mut vc) {
+                            if vc_child.kind() == "variable_declarator"
+                                && let Some(name_node) = vc_child.child_by_field_name("name")
+                            {
+                                exports.push(ExportedSymbol {
+                                    name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                                    kind: SymbolKind::Variable,
+                                    signature: None,
+                                });
                             }
                         }
                     }

@@ -287,24 +287,22 @@ fn collect_exports(node: tree_sitter::Node<'_>, source: &[u8], exports: &mut Vec
                     });
                 }
             }
-            "field_declaration" | "constant_declaration" => {
-                if has_public_modifier(child, source) {
-                    let kind = if child.kind() == "constant_declaration" {
-                        SymbolKind::Constant
-                    } else {
-                        SymbolKind::Variable
-                    };
-                    let mut field_cursor = child.walk();
-                    for field_child in child.children(&mut field_cursor) {
-                        if field_child.kind() == "variable_declarator"
-                            && let Some(name) = field_child.child_by_field_name("name")
-                        {
-                            exports.push(ExportedSymbol {
-                                name: name.utf8_text(source).unwrap_or("").to_string(),
-                                kind,
-                                signature: None,
-                            });
-                        }
+            "field_declaration" | "constant_declaration" if has_public_modifier(child, source) => {
+                let kind = if child.kind() == "constant_declaration" {
+                    SymbolKind::Constant
+                } else {
+                    SymbolKind::Variable
+                };
+                let mut field_cursor = child.walk();
+                for field_child in child.children(&mut field_cursor) {
+                    if field_child.kind() == "variable_declarator"
+                        && let Some(name) = field_child.child_by_field_name("name")
+                    {
+                        exports.push(ExportedSymbol {
+                            name: name.utf8_text(source).unwrap_or("").to_string(),
+                            kind,
+                            signature: None,
+                        });
                     }
                 }
             }

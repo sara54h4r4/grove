@@ -24,7 +24,7 @@ pub enum DbError {
 }
 
 pub struct Database {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Database {
@@ -44,6 +44,7 @@ impl Database {
     }
 
     fn run_migrations(&self) -> Result<(), DbError> {
+        crate::coordination::migrate(&self.conn)?;
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS workspaces (

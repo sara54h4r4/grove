@@ -21,3 +21,18 @@ target/llvm-cov-target/
 # Mutation testing artifacts
 mutants.out/
 mutants.out.old/
+.vercel
+.env*
+.agents/
+skills-lock.json
+scripts/__pycache__/
+
+# Current coordination guide and review evidence; older ignored docs stay ignored.
+!docs/
+docs/*
+!docs/coordination.md
+!docs/codex-cloud-agent-prompt.txt
+!docs/coordination-evidence.md
+!docs/coordination-local-receipt.json
+!docs/coordination-hosted-receipt.json
+!docs/coordination-codex-receipt.json
