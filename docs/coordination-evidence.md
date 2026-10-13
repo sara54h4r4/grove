@@ -76,6 +76,15 @@ poll checks vary with process startup), with no missed or duplicate message
 effects. Committed WAL migration, ambiguous bare-root isolation, and literal
 Next.js paths/renames/deletions/binary/mode evidence have dedicated tests.
 
+The first clean Linux CI run exposed an existing OpenCode test race: concurrent
+tests changed process-wide environment variables. The follow-up keeps all nine
+configuration tests and supplies independent values to the same production
+parser, removing unsafe environment mutation. Build, tests and Clippy passed on
+that clean runner; its formatter identified one method-chain wrap, corrected
+from the runner's exact diff. Follow-up checks run on GitHub because the local
+execution workspace disconnected after the original change was pushed. See the
+[current PR checks](https://github.com/sara54h4r4/grove/pull/1/checks).
+
 The production endpoint is <https://grove-coordination.vercel.app/coord>. Real
 HTTPS from this Codex Cloud workspace reached native Vercel Rust Functions and
 Neon Postgres. Missing participant credentials returned 401; the wrong repository
@@ -109,8 +118,11 @@ Receipts: [local](coordination-local-receipt.json),
 [hosted](coordination-hosted-receipt.json), and
 [real Codex sessions](coordination-codex-receipt.json). Complete public event logs
 remain outside the repository at `/workspace/research/codex-live-demo-verified`.
-The two CLI sessions share this Cloud execution environment; they are not two
-independently managed Codex Cloud tasks. The user's separate analytics environment
+A separately cloned IWS checkout also discovered both real native peers over
+production HTTPS, without creating a local coordination database or sharing
+Git metadata with their worktrees. Its participant was an explicitly synthetic
+transport fixture. The two CLI sessions and independent clone share this Cloud
+execution environment; they are not independently managed Codex Cloud tasks. The user's separate analytics environment
 still needs the four client variables and trusted MCP configuration from the
 guide; this chat has no settings API for that environment. A private ignored
 `.env.grove-client` contains only its client settings; secrets were not committed.
