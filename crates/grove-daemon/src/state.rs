@@ -4105,7 +4105,9 @@ mod tests {
                 "OPENCODE_SERVER_PASSWORD" => pass,
                 _ => None,
             };
-            value.map(str::to_owned).ok_or(std::env::VarError::NotPresent)
+            value
+                .map(str::to_owned)
+                .ok_or(std::env::VarError::NotPresent)
         })
     }
 
