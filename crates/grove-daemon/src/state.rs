@@ -51,7 +51,13 @@ impl OpenCodeConfig {
     ///
     /// Credentials are **never** included in any returned error message.
     pub fn from_env() -> Result<Option<Self>, String> {
-        let url = match std::env::var("OPENCODE_SERVER_URL") {
+        Self::from_lookup(std::env::var)
+    }
+
+    fn from_lookup(
+        mut variable: impl FnMut(&'static str) -> Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, String> {
+        let url = match variable("OPENCODE_SERVER_URL") {
             Ok(v) => v,
             Err(std::env::VarError::NotPresent) => return Ok(None),
             Err(_) => {
@@ -65,7 +71,7 @@ impl OpenCodeConfig {
         let url = url.trim();
         validate_opencode_server_url(url)?;
 
-        let username = match std::env::var("OPENCODE_SERVER_USERNAME") {
+        let username = match variable("OPENCODE_SERVER_USERNAME") {
             Ok(v) => v,
             Err(_) => {
                 return Err(
@@ -80,7 +86,7 @@ impl OpenCodeConfig {
             );
         }
 
-        let password = match std::env::var("OPENCODE_SERVER_PASSWORD") {
+        let password = match variable("OPENCODE_SERVER_PASSWORD") {
             Ok(v) => v,
             Err(_) => {
                 return Err(
@@ -4086,153 +4092,84 @@ mod tests {
 
     // ── OpenCodeConfig tests ────────────────────────────────────────────────
 
-    /// Run a closure with specific env var values, restoring the originals after.
-    /// SAFETY: like `std::env::set_var`/`remove_var`, not thread-safe.
-    unsafe fn with_opencode_env<F, R>(
+    /// Evaluate the production parser against independent test values.
+    fn opencode_config(
         url: Option<&str>,
         user: Option<&str>,
         pass: Option<&str>,
-        f: F,
-    ) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let prev_url = std::env::var("OPENCODE_SERVER_URL").ok();
-        let prev_user = std::env::var("OPENCODE_SERVER_USERNAME").ok();
-        let prev_pass = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
-
-        // Set new values
-        match url {
-            Some(v) => unsafe { std::env::set_var("OPENCODE_SERVER_URL", v) },
-            None => unsafe { std::env::remove_var("OPENCODE_SERVER_URL") },
-        }
-        match user {
-            Some(v) => unsafe { std::env::set_var("OPENCODE_SERVER_USERNAME", v) },
-            None => unsafe { std::env::remove_var("OPENCODE_SERVER_USERNAME") },
-        }
-        match pass {
-            Some(v) => unsafe { std::env::set_var("OPENCODE_SERVER_PASSWORD", v) },
-            None => unsafe { std::env::remove_var("OPENCODE_SERVER_PASSWORD") },
-        }
-
-        let result = f();
-
-        // Restore
-        match prev_url {
-            Some(v) => unsafe { std::env::set_var("OPENCODE_SERVER_URL", v) },
-            None => unsafe { std::env::remove_var("OPENCODE_SERVER_URL") },
-        }
-        match prev_user {
-            Some(v) => unsafe { std::env::set_var("OPENCODE_SERVER_USERNAME", v) },
-            None => unsafe { std::env::remove_var("OPENCODE_SERVER_USERNAME") },
-        }
-        match prev_pass {
-            Some(v) => unsafe { std::env::set_var("OPENCODE_SERVER_PASSWORD", v) },
-            None => unsafe { std::env::remove_var("OPENCODE_SERVER_PASSWORD") },
-        }
-
-        result
+    ) -> Result<Option<OpenCodeConfig>, String> {
+        OpenCodeConfig::from_lookup(|name| {
+            let value = match name {
+                "OPENCODE_SERVER_URL" => url,
+                "OPENCODE_SERVER_USERNAME" => user,
+                "OPENCODE_SERVER_PASSWORD" => pass,
+                _ => None,
+            };
+            value.map(str::to_owned).ok_or(std::env::VarError::NotPresent)
+        })
     }
 
     #[test]
     fn opencode_config_no_env_vars_disabled() {
-        unsafe {
-            let result = with_opencode_env(None, None, None, OpenCodeConfig::from_env);
-            assert!(result.unwrap().is_none());
-        }
+        let result = opencode_config(None, None, None);
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
     fn opencode_config_all_vars_configured() {
-        unsafe {
-            let result = with_opencode_env(
-                Some("http://localhost:8080"),
-                Some("testuser"),
-                Some("testpass"),
-                OpenCodeConfig::from_env,
-            );
-            let cfg = result.unwrap().unwrap();
-            assert_eq!(cfg.server_url, "http://localhost:8080");
-        }
+        let result = opencode_config(
+            Some("http://localhost:8080"),
+            Some("testuser"),
+            Some("testpass"),
+        );
+        let cfg = result.unwrap().unwrap();
+        assert_eq!(cfg.server_url, "http://localhost:8080");
     }
 
     #[test]
     fn opencode_config_url_without_username_errors() {
-        unsafe {
-            let result = with_opencode_env(
-                Some("http://localhost:8080"),
-                None,
-                Some("somepass"),
-                OpenCodeConfig::from_env,
-            );
-            let err = result.unwrap_err();
-            assert!(
-                err.contains("OPENCODE_SERVER_USERNAME"),
-                "error should mention USERNAME, got: {err}"
-            );
-            assert!(!err.contains("somepass"), "error must not leak password");
-        }
+        let result = opencode_config(Some("http://localhost:8080"), None, Some("somepass"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("OPENCODE_SERVER_USERNAME"),
+            "error should mention USERNAME, got: {err}"
+        );
+        assert!(!err.contains("somepass"), "error must not leak password");
     }
 
     #[test]
     fn opencode_config_url_without_password_errors() {
-        unsafe {
-            let result = with_opencode_env(
-                Some("http://localhost:8080"),
-                Some("someuser"),
-                None,
-                OpenCodeConfig::from_env,
-            );
-            let err = result.unwrap_err();
-            assert!(
-                err.contains("OPENCODE_SERVER_PASSWORD"),
-                "error should mention PASSWORD, got: {err}"
-            );
-            assert!(!err.contains("someuser"), "error must not leak username");
-        }
+        let result = opencode_config(Some("http://localhost:8080"), Some("someuser"), None);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("OPENCODE_SERVER_PASSWORD"),
+            "error should mention PASSWORD, got: {err}"
+        );
+        assert!(!err.contains("someuser"), "error must not leak username");
     }
 
     #[test]
     fn opencode_config_password_without_username_errors() {
-        unsafe {
-            let result = with_opencode_env(
-                Some("http://localhost:8080"),
-                None,
-                Some("secret123"),
-                OpenCodeConfig::from_env,
-            );
-            let err = result.unwrap_err();
-            assert!(
-                err.contains("OPENCODE_SERVER_USERNAME"),
-                "error should mention USERNAME, got: {err}"
-            );
-            assert!(!err.contains("secret123"), "error must not leak password");
-        }
+        let result = opencode_config(Some("http://localhost:8080"), None, Some("secret123"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("OPENCODE_SERVER_USERNAME"),
+            "error should mention USERNAME, got: {err}"
+        );
+        assert!(!err.contains("secret123"), "error must not leak password");
     }
 
     #[test]
     fn opencode_config_rejects_empty_credentials() {
-        unsafe {
-            let result = with_opencode_env(
-                Some("http://localhost:8080"),
-                Some("  "),
-                Some("testpass"),
-                OpenCodeConfig::from_env,
-            );
-            let error = result.unwrap_err();
-            assert!(error.contains("OPENCODE_SERVER_USERNAME"));
-            assert!(!error.contains("testpass"));
+        let result = opencode_config(Some("http://localhost:8080"), Some("  "), Some("testpass"));
+        let error = result.unwrap_err();
+        assert!(error.contains("OPENCODE_SERVER_USERNAME"));
+        assert!(!error.contains("testpass"));
 
-            let result = with_opencode_env(
-                Some("http://localhost:8080"),
-                Some("testuser"),
-                Some(""),
-                OpenCodeConfig::from_env,
-            );
-            let error = result.unwrap_err();
-            assert!(error.contains("OPENCODE_SERVER_PASSWORD"));
-            assert!(!error.contains("testuser"));
-        }
+        let result = opencode_config(Some("http://localhost:8080"), Some("testuser"), Some(""));
+        let error = result.unwrap_err();
+        assert!(error.contains("OPENCODE_SERVER_PASSWORD"));
+        assert!(!error.contains("testuser"));
     }
 
     #[test]
@@ -4259,39 +4196,27 @@ mod tests {
 
     #[test]
     fn opencode_config_error_messages_do_not_expose_credentials() {
-        unsafe {
-            // URL present but username missing — error must not expose password value
-            let result =
-                with_opencode_env(Some("http://localhost:8080"), None, Some("s3cret"), || {
-                    OpenCodeConfig::from_env()
-                });
-            let err = result.unwrap_err();
-            assert!(
-                !err.contains("s3cret"),
-                "error must not expose password: {err}"
-            );
-            assert!(
-                !err.contains("localhost"),
-                "error should not contain URL value: {err}"
-            );
-        }
+        let result = opencode_config(Some("http://localhost:8080"), None, Some("s3cret"));
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("s3cret"),
+            "error must not expose password: {err}"
+        );
+        assert!(
+            !err.contains("localhost"),
+            "error should not contain URL value: {err}"
+        );
 
-        unsafe {
-            // URL present but password missing — error must not expose username value
-            let result =
-                with_opencode_env(Some("http://localhost:8080"), Some("admin"), None, || {
-                    OpenCodeConfig::from_env()
-                });
-            let err = result.unwrap_err();
-            assert!(
-                !err.contains("admin"),
-                "error must not expose username: {err}"
-            );
-            assert!(
-                !err.contains("localhost"),
-                "error should not contain URL value: {err}"
-            );
-        }
+        let result = opencode_config(Some("http://localhost:8080"), Some("admin"), None);
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("admin"),
+            "error must not expose username: {err}"
+        );
+        assert!(
+            !err.contains("localhost"),
+            "error should not contain URL value: {err}"
+        );
     }
 
     #[test]
