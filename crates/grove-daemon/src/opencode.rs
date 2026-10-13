@@ -415,7 +415,10 @@ mod tests {
         let body = response_body.to_string();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            while matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+            while matches!(
+                stop_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         write_response(stream, status, &body);

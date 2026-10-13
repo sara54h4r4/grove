@@ -85,8 +85,9 @@ parser, removing unsafe environment mutation. macOS then exposed a separate
 fixture race: its listener exited after 500 ms, potentially before native TLS
 client construction finished. That one-shot mock now remains available until
 the request arrives or its guard cancels it; the lifecycle assertion is unchanged.
-Follow-up checks run on GitHub because the local execution workspace disconnected
-after the original change was pushed. See the
+After these fixes, the focused OpenCode suite passed 29 tests with the same one
+ignored live-server test; strict Clippy for all daemon targets and local formatting
+also passed. Follow-up CI validation is tracked in the
 [current PR checks](https://github.com/sara54h4r4/grove/pull/1/checks).
 
 The production endpoint is <https://grove-coordination.vercel.app/coord>. Real
