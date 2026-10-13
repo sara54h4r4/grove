@@ -401,8 +401,14 @@ mod tests {
         (url, MockServer(Some(handle)))
     }
 
-    /// Spawn a one-shot mock that exits if the client never connects.
-    fn spawn_optional_mock(response_body: &str, status: u16) -> (String, MockServer) {
+    /// Keep the one-shot mock available until a request arrives or its guard drops.
+    ///
+    /// Client construction can take longer than a fixed deadline on macOS.
+    /// Cancellation still lets a failed client test join the server thread.
+    fn spawn_cancellable_mock(
+        response_body: &str,
+        status: u16,
+    ) -> (String, CancellableMockServer) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         listener
             .set_nonblocking(true)
@@ -410,9 +416,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{port}");
         let body = response_body.to_string();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_millis(500);
-            while std::time::Instant::now() < deadline {
+            while matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         write_response(stream, status, &body);
@@ -425,7 +431,27 @@ mod tests {
                 }
             }
         });
-        (url, MockServer(Some(handle)))
+        (
+            url,
+            CancellableMockServer {
+                handle: Some(handle),
+                stop: stop_tx,
+            },
+        )
+    }
+
+    struct CancellableMockServer {
+        handle: Option<std::thread::JoinHandle<()>>,
+        stop: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Drop for CancellableMockServer {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// Spawn a mock that handles multiple paginated requests.
@@ -946,7 +972,7 @@ mod tests {
 
         let body =
             "data: {\"type\":\"message.updated\",\"data\":{\"sessionID\":\"session-1\"}}\n\n";
-        let (url, _server) = spawn_optional_mock(body, 200);
+        let (url, _server) = spawn_cancellable_mock(body, 200);
         let adapter = OpenCodeAdapter::new(&url, "user", "pass");
         let (events_tx, mut events_rx) = mpsc::channel(1);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
