@@ -11,8 +11,13 @@ https://github.com/sara54h4r4/grove/blob/main/docs/coordination-evidence.md
 I will enter these four values myself in this Codex Cloud environment:
 - Environment variable GROVE_COORD_URL = https://grove-coordination.vercel.app/coord
 - Environment variable GROVE_REPOSITORY_ID = 13f4fc87-5296-4dd7-be15-e54a1a2a290b
-- Secret GROVE_COORD_TOKEN = the supplied participant credential
-- Secret GROVE_VERCEL_PROTECTION_BYPASS = the supplied project automation credential
+- Environment variable GROVE_COORD_TOKEN = the supplied participant credential
+- Environment variable GROVE_VERCEL_PROTECTION_BYPASS = the supplied project automation credential
+
+Use the Environment variables field for all four keys so they remain available
+during the agent phase. The last two values are sensitive credentials; calling
+them sensitive does not mean putting them in Codex Cloud's setup-only Secrets
+field. Preserve our runtime Environment variable approach.
 
 Credential values are intentionally absent from this prompt. Do not request or
 print them, place them in source files or TOML, commit them, or dump the environment.
@@ -30,19 +35,15 @@ database, or another coordination endpoint. Do not merge or deploy IWS changes.
    checkout a tools repository. Use a reviewed commit and record its full SHA.
    Install a working Rust toolchain and C compiler if needed (Rust 1.99.0 was
    verified), then run cargo build -p grove --locked in Grove. Install its binary
-   at $HOME/.local/bin/grove. Ensure Python 3.11+ is available.
+   at $HOME/.local/bin/grove.
 
-3. Follow the setup guide's private runtime-wrapper recipe from the actual IWS
-   Git root after installing Grove. Codex Cloud Secrets exist only during setup
-   and are removed before the agent phase. The recipe intentionally retains only
-   these four client settings in a mode-0600 file under a mode-0700 directory
-   outside every checkout, so the same task user's MCP process can authenticate.
-   Install $HOME/.local/bin/grove-cloud; it restores those four settings only for
-   Grove. Never include GROVE_COORD_APPROVER_TOKEN, DATABASE_URL,
-   DATABASE_URL_UNPOOLED, personal VERCEL_TOKEN, or unrelated credentials.
-   Regenerate the runtime file during setup when Secrets rotate; refresh the
-   environment cache when necessary. Do not put credential values in cached
-   build outputs, logs, prompts, or repository files.
+3. Use Grove directly with the four runtime Environment variables. Check names
+   and presence in the agent phase without printing values. Never include
+   GROVE_COORD_APPROVER_TOKEN, DATABASE_URL, DATABASE_URL_UNPOOLED, personal
+   VERCEL_TOKEN, or unrelated credentials in the agent environment or Grove MCP
+   forwarding list. The MCP configuration below forwards client variable names;
+   it does not contain their values. Start a fresh task after changing the
+   environment settings and refresh the environment cache when necessary.
 
 4. Configure the official Codex MCP surface actually loaded by Cloud tasks.
    The usual file is $CODEX_HOME/config.toml, or ~/.codex/config.toml if CODEX_HOME
@@ -51,34 +52,35 @@ database, or another coordination endpoint. Do not merge or deploy IWS changes.
    not expand $HOME. Confirm the IWS root with git rev-parse --show-toplevel.
 
    [mcp_servers.grove]
-   command = "/ABSOLUTE_HOME/.local/bin/grove-cloud"
+   command = "/ABSOLUTE_HOME/.local/bin/grove"
    args = ["mcp", "--repo", "/ACTUAL/IWS/ROOT"]
    default_tools_approval_mode = "approve"
    enabled_tools = ["grove_register", "grove_heartbeat", "grove_sync",
      "grove_checkpoint", "grove_send", "grove_ack_message", "grove_propose",
      "grove_ack_decision", "grove_claim", "grove_renew_claim",
      "grove_release_claim", "grove_get_transfer"]
-   env_vars = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+   env_vars = ["GROVE_COORD_URL", "GROVE_COORD_TOKEN", "GROVE_REPOSITORY_ID",
+     "GROVE_VERCEL_PROTECTION_BYPASS", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
      "SSL_CERT_FILE", "SSL_CERT_DIR"]
 
    This approval setting is specific to Grove's twelve participant tools; keep
-   global policies and other servers unchanged. The wrapper obtains the four
-   client settings from its private file, and Codex forwards proxy/CA variable
-   names. Operator approval/review remains separate and unavailable through MCP.
+   global policies and other servers unchanged. Codex forwards the four Grove
+   variable names and proxy/CA variable names to the direct stdio process.
+   Operator approval/review remains separate and unavailable through MCP.
 
 5. Allow agent-phase HTTPS access to grove-coordination.vercel.app using the
    Cloud environment's supported network policy. Preserve other project rules
    and proxy/CA trust. Setup also needs GitHub and Rust dependency access under
    the existing policy. Keep Vercel Deployment Protection enabled.
 
-6. Validate in a fresh task after setup, not solely in the setup shell. With the
-   original Secret environment variables absent, run the wrapped CLI from IWS:
-   "$HOME/.local/bin/grove-cloud" --json coord hello
+6. Validate in a fresh task after setup, not solely in the setup shell. With all
+   four runtime Environment variables present, run the direct CLI from IWS:
+   "$HOME/.local/bin/grove" --json coord hello
    It must reach the hosted service and return repository ID
    13f4fc87-5296-4dd7-be15-e54a1a2a290b. Verify codex mcp get grove --json and
-   official stdio MCP initialize/tools-list show the same wrapper, actual IWS
-   root, and exactly the twelve tools above. Do not print private-file contents,
+   official stdio MCP initialize/tools-list show the direct binary, actual IWS
+   root, and exactly the twelve tools above. Do not print credential values,
    pass credentials on the command line, start a local daemon, or accept local
    fallback as proof of Cloud connectivity. Confirm IWS tracked files and branch
    are unchanged. Report any platform-managed MCP restriction honestly.
@@ -95,7 +97,7 @@ database, or another coordination endpoint. Do not merge or deploy IWS changes.
    one or scanning private session storage. Preserve IWS repository instructions.
 
 Return a short receipt containing the setup/maintenance changes, reviewed Grove
-commit SHA, installed paths, loaded MCP configuration, credential-file permissions,
+commit SHA, installed paths, loaded MCP configuration, forwarded variable names,
 agent-phase connectivity and tool-list results, and any blocked checks. Show only
 variable names and presence, never values. Idle model wakeup, automatic GitHub PR
 polling, and an independent managed-Cloud-task/subagent demonstration are remaining

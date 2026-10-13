@@ -35,7 +35,7 @@ Vercel; installing this client does not deploy IWS or provision AWS.
 Build a reviewed checkout of `https://github.com/sara54h4r4/grove` on `main`
 **outside the IWS checkout** in the existing Cloud setup script. Preserve that
 script's current IWS dependency installation. Rust 1.99.0 was used for verification;
-the client build also needs a C compiler. Python 3.11+ is used below.
+the client build also needs a C compiler.
 
 ```sh
 cargo build -p grove --locked
@@ -43,89 +43,37 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 target/debug/grove "$HOME/.local/bin/grove"
 ```
 
-Add the two public values as Environment variables and the two credentials as
-Secrets in the Codex Cloud environment. Use the same repository ID for all
-isolated IWS clones. Keep credential values out of repository documents, scripts,
-MCP TOML, model prompts, and logs. The private client handoff contains their
-existing values; no new database or operator credential is needed.
+Add **all four values as Environment variables** in the Codex Cloud environment,
+so they are available during both setup and agent execution. This retains the
+user's working runtime-variable setup. The last two values are sensitive
+credentials, but that does not mean selecting the UI's Secrets field. Use the
+same repository ID for all isolated IWS clones. Keep credential values out of
+repository documents, scripts, MCP TOML, model prompts, and logs. The private
+client handoff contains their existing values; no new database or operator
+credential is needed.
 
 | Variable | Codex Cloud field | Value / purpose |
 | --- | --- | --- |
 | `GROVE_COORD_URL` | Environment variable; public | `https://grove-coordination.vercel.app/coord` |
 | `GROVE_REPOSITORY_ID` | Environment variable; public | `13f4fc87-5296-4dd7-be15-e54a1a2a290b` |
-| `GROVE_COORD_TOKEN` | Secret | Participant bearer credential from the private handoff |
-| `GROVE_VERCEL_PROTECTION_BYPASS` | Secret | Project-scoped automation credential from the private handoff |
+| `GROVE_COORD_TOKEN` | Environment variable; sensitive credential | Participant bearer credential from the private handoff |
+| `GROVE_VERCEL_PROTECTION_BYPASS` | Environment variable; sensitive credential | Project-scoped automation credential from the private handoff |
 
 [OpenAI's environment documentation](https://learn.chatgpt.com/docs/environments/cloud-environment)
-states that Secrets are available only during setup and removed before the agent
-phase. Grove requires participant credentials when MCP runs. During setup, the
-following recipe copies **only these four client settings** to a private file
-outside all repository contents and installs a small runtime wrapper. This is an
-intentional runtime handoff for those two credentials: processes running as the
-same task user can read the file. Database credentials, the operator token, and
-personal Vercel tokens must never be copied or forwarded.
+states that Environment variables last through the agent phase, while Secrets
+are removed after setup. Grove needs its participant credentials when MCP runs,
+so this setup uses the ordinary runtime Environment variables directly.
+Database credentials, the operator token, and personal Vercel tokens must not be
+included in the agent environment or MCP forwarding list.
 
-Run this recipe from the **IWS root**, after installing the Grove binary:
-
-```python
-import json
-import os
-from pathlib import Path
-import subprocess
-
-keys = ["GROVE_COORD_URL", "GROVE_REPOSITORY_ID", "GROVE_COORD_TOKEN",
-        "GROVE_VERCEL_PROTECTION_BYPASS"]
-missing = [key for key in keys if not os.environ.get(key)]
-if missing:
-    raise SystemExit("Missing setup variables: " + ", ".join(missing))
-settings = {key: os.environ[key] for key in keys}
-repo = Path(subprocess.check_output(
-    ["git", "rev-parse", "--show-toplevel"], text=True).strip()).resolve()
-binary = Path.home() / ".local/bin/grove"
-if not binary.is_file() or not os.access(binary, os.X_OK):
-    raise SystemExit("Install the reviewed Grove binary first")
-state = Path.home() / ".local/share/grove/codex-cloud"
-state.mkdir(parents=True, exist_ok=True, mode=0o700)
-state.chmod(0o700)
-client = state / "client.json"
-fd = os.open(client, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-with os.fdopen(fd, "w") as output:
-    os.fchmod(output.fileno(), 0o600)
-    json.dump(settings, output)
-    output.write("\n")
-wrapper = binary.with_name("grove-cloud")
-wrapper.write_text(
-    "#!/usr/bin/env python3\n"
-    "import json, os, sys\n"
-    "from pathlib import Path\n"
-    f"client = Path({str(client)!r})\n"
-    "if client.stat().st_mode & 0o077:\n"
-    "    raise SystemExit('Grove client settings must be private')\n"
-    "settings = json.loads(client.read_text())\n"
-    f"keys = {keys!r}\n"
-    "if set(settings) != set(keys) or any(not settings[k] for k in keys):\n"
-    "    raise SystemExit('Incomplete Grove client settings')\n"
-    "env = os.environ.copy()\n"
-    "for key in ('GROVE_COORD_APPROVER_TOKEN', 'DATABASE_URL',\n"
-    "            'DATABASE_URL_UNPOOLED', 'VERCEL_TOKEN'):\n"
-    "    env.pop(key, None)\n"
-    "env.update(settings)\n"
-    f"binary = {str(binary)!r}\n"
-    "os.execve(binary, [binary, *sys.argv[1:]], env)\n"
-)
-wrapper.chmod(0o755)
-print("Grove wrapper:", wrapper)
-print("IWS root:", repo)
-```
-
-Insert the generated absolute wrapper path and actual IWS root into the MCP block
+Insert the installed binary's absolute path and actual IWS root into the MCP block
 below. Merge only this server block into the Codex configuration actually loaded
 by the Cloud task (normally `$CODEX_HOME/config.toml`, or `~/.codex/config.toml`
 when `CODEX_HOME` is unset). Preserve every other server and setting. Config files
 do not expand `$HOME` inside TOML strings; use real absolute paths.
 
 ```sh
-"$HOME/.local/bin/grove-cloud" --json coord hello
+"$HOME/.local/bin/grove" --json coord hello
 codex mcp get grove --json
 ```
 
@@ -134,13 +82,14 @@ Codex configuration; otherwise a `never` approval policy rejects even MCP calls:
 
 ```toml
 [mcp_servers.grove]
-command = "/ABSOLUTE_HOME/.local/bin/grove-cloud"
+command = "/ABSOLUTE_HOME/.local/bin/grove"
 args = ["mcp", "--repo", "/ACTUAL/IWS/ROOT"]
 default_tools_approval_mode = "approve"
 enabled_tools = ["grove_register", "grove_heartbeat", "grove_sync", "grove_checkpoint",
   "grove_send", "grove_ack_message", "grove_propose", "grove_ack_decision",
   "grove_claim", "grove_renew_claim", "grove_release_claim", "grove_get_transfer"]
-env_vars = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+env_vars = ["GROVE_COORD_URL", "GROVE_COORD_TOKEN", "GROVE_REPOSITORY_ID",
+  "GROVE_VERCEL_PROTECTION_BYPASS", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
   "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
   "SSL_CERT_FILE", "SSL_CERT_DIR"]
 ```
@@ -148,10 +97,9 @@ env_vars = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 The approval setting applies only to this server. Operator approval/review tools
 are absent from MCP. Other tool and shell policies remain independently configured.
 
-Codex forwards the declared proxy/CA variable names to the stdio process, and the
-wrapper loads the four client settings privately. A runtime that already supplies
-all four settings can use `grove` directly and add those four names to `env_vars`
-instead. In either case, confirm the runtime can connect without printing values.
+Codex forwards only the declared variable names to the stdio process. Include all
+four Grove names along with the Cloud proxy/CA names; values stay in the runtime
+environment. Confirm the runtime can connect without printing values.
 The client does not create a local coordination database with remote configuration;
 partial configuration fails closed.
 
@@ -162,8 +110,8 @@ under the platform's supported policy. Do not broaden agent access to unrelated
 domains or disable Vercel protection. Re-run setup in a fresh task after rotating
 either credential; refresh/reset the environment cache as necessary.
 
-Verify the **agent phase**, with the two original Secret environment variables
-absent: the wrapped CLI must return repository ID
+Verify the **agent phase**, with all four Environment variables present: the
+direct Grove CLI must return repository ID
 `13f4fc87-5296-4dd7-be15-e54a1a2a290b`, and official MCP initialize/tools-list must
 expose exactly the twelve tools above. Report paths, tool names, repository ID and
 success/failure only. Do not launch a local daemon or accept local fallback for this
