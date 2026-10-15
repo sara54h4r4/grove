@@ -104,6 +104,22 @@ async fn handler(request: Request) -> Result<Response<ResponseBody>, Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    if let Some(index) = std::env::args().position(|a| a == "--import-snapshot") {
+        let path = std::env::args()
+            .nth(index + 1)
+            .ok_or("--import-snapshot requires a private archive path")?;
+        if std::fs::metadata(&path)?.len() > (grove_cloud::MAX_SNAPSHOT_BYTES + 1_048_576) as u64 {
+            return Err("archive exceeds import size bound".into());
+        }
+        let archive = serde_json::from_slice(&std::fs::read(path)?)?;
+        let config = Config::from_environment(true).map_err(std::io::Error::other)?;
+        config
+            .import_snapshot(archive)
+            .await
+            .map_err(std::io::Error::other)?;
+        println!("Coordination archive imported into empty destination");
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--migrate") {
         let config = Config::from_environment(true).map_err(std::io::Error::other)?;
         config.migrate().await.map_err(std::io::Error::other)?;

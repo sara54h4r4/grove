@@ -131,7 +131,13 @@ context. Approval requires the operator's separate credential.
 
 Grove does not wake an idle model. Delivery to durable storage, service retrieval,
 and model acknowledgement have distinct timestamps. No background LLM loop is
-required; agents choose their polling interval while a turn is active.
+required. Use one poller per actual session while a turn is active. Back off
+unchanged polls toward 30–60 seconds when idle; choose a shorter interval only
+when the task needs that latency. Keep heartbeats inside the 120-second stale
+window and renew claims before their independent expiry. Checkpoint only after
+processing a newly served cursor. Avoid duplicate background loops. Send concise
+commit/path/hash references and retrievable artifacts instead of repeated full
+patches; previously stored messages and events remain recoverable.
 
 ## Local worktrees
 
@@ -147,14 +153,22 @@ Bare metadata does not import an ambiguous parent-directory `.grove` store.
 ## Hosting and operator work
 
 `api/coord.rs` is a native Rust Vercel Function. Postgres is the durable cloud owner;
-ephemeral SQLite evaluates the same tested state machine. A revision-checked
-Postgres update commits the complete snapshot atomically; concurrent losers reload
-and re-evaluate. No container filesystem or process memory owns cloud state.
+ephemeral SQLite evaluates the same tested state machine over a consistent,
+operation-specific working set. Indexed Postgres rows retain the complete history.
+A revision-checked statement commits changed rows and new events atomically;
+concurrent losers reload and re-evaluate. No container filesystem or process
+memory owns cloud state. A bounded 8 MiB/32-entry sync cache validates context and
+event revisions against Postgres on every hit, refreshes heartbeat/checkpoint/
+served cursors, and recomputes staleness and claim expiry. Cold processes recover
+from Postgres. Historical payloads outside the requested page stay in Postgres.
 
-Link a separate Grove project, connect Neon, and configure `DATABASE_URL` (pooled),
-`DATABASE_URL_UNPOOLED` (migration), the repository UUID, participant token, and
+Link a separate Grove project, connect Neon, and configure
+`GROVE_COORD_DATABASE_URL` (pooled), `GROVE_COORD_DATABASE_URL_UNPOOLED`
+(migration), the repository UUID, participant token, and
 **separate** `GROVE_COORD_APPROVER_TOKEN`. Keep the approver and database credentials
-out of agent environments. Review the checked-in migration, verify the linked
+out of agent environments. Legacy `DATABASE_URL` / `DATABASE_URL_UNPOOLED` are
+fallbacks when the dedicated variable is absent; an empty dedicated value fails
+closed. Review the checked-in migrations, verify the linked
 project/account, then run:
 
 ```sh
@@ -170,6 +184,31 @@ access separately. One deployment is pinned to one repository, with separate
 credentials for other repositories. Sharing a participant token trusts those
 participants to report their own session IDs; native identities are not
 cryptographically attested by Grove.
+
+For a move from the legacy snapshot store, use `scripts/migrate_coordination.py` with explicit private
+source/target/client env files and distinct project IDs. Export once to a new
+private archive path, initialize the empty destination with `coord --migrate`,
+and stage the deployment. Then `freeze` the source at the exported revision,
+`import` into the empty destination, and `verify` all eight table counts and
+content digests before any mutating probes or promotion. If the revision changed,
+export a fresh archive and retry the fence. The trigger rejects legacy snapshot
+writes, including no-op writes, so old deployments cannot acknowledge divergent
+state. Import refuses to overwrite an active destination. The source snapshot
+and private archive are retained; this process deletes no coordination history.
+The exporter refuses an active version-2 row store: its archived snapshot is not
+a current backup. Future moves of a live row store need a complete Postgres
+backup or branch/project migration that includes all indexed rows and metadata.
+After cutover, retire the old deployment's database access to stop obsolete
+URLs from continuing to read the old snapshot. Do not roll back to a legacy
+writer after new writes: deploy a compatible row-store build against the new DB.
+
+Each request logs operation, CAS attempts, SQL query count, consumed SQL response
+body bytes, projected row count, cache hits and outcome as `grove_coord` metrics.
+These logs contain no bodies, session IDs, SQL or credentials. Response body bytes
+measure application reads, not exact billed network transfer. Monitor them
+alongside Neon's delayed project transfer meter. A cache miss still reads current
+peers, claims, applicable decisions and up to 100 transfer summaries; large
+current context or unread messages can cost more than an unchanged warm poll.
 
 ## Whole-branch transfer ledger
 
@@ -196,17 +235,18 @@ visibly rather than dropping files.
 
 ## Bounds and next work
 
-This milestone bounds requests to 1 MiB, responses to 4 MiB, snapshots to 16 MiB,
-and inbox/event pages to 100. History currently has no automatic retention; archive
-or migrate deliberately before reaching the snapshot bound. Each request reads
-and writes a snapshot, including context retrieval. Measure database bandwidth,
-contention and cold starts before scaling; native Postgres tables and retention
-are the next storage work. Stale sessions are projected after 120 seconds; claims
+This milestone bounds requests to 1 MiB, responses to 4 MiB, migration archives
+to 16 MiB, SQL responses to 17 MiB, and inbox/event pages to 100 (at most 1,000
+event headers scanned per page). Stored history is not subject to the old
+total-snapshot bound and has no automatic deletion or retention policy.
+Heartbeat/checkpoint and unchanged sync reads do not grow with acknowledged
+message/event history. Measure database bandwidth, contention and cold starts
+before scaling. Stale sessions are projected after 120 seconds; claims
 expire independently and carry fencing epochs. Expired claims grant no authority
 to edit or merge.
 
 Next priorities are independent Cloud-task validation, ergonomic native identity
-registration, explicit PR refresh, measured retention/scale, and optional hooks
+registration, explicit PR refresh, measured scale, and optional hooks
 whose official payload can meet the privacy contract. Idle model wakeups,
 automatic semantic approval, private transcript extraction, a generic policy
 registry, queues/brokers, and continuous paid agent calls are outside this scope.
@@ -214,4 +254,10 @@ registry, queues/brokers, and continuous paid agent calls are outside this scope
 The hosted IWS instance is `https://grove-coordination.vercel.app/coord`, with repository ID
 `13f4fc87-5296-4dd7-be15-e54a1a2a290b` in the `grove-coordination` Vercel project
 under Sara Sahara's projects. Neon is managed through that Vercel integration
-(`muddy-math-90157843`), rather than a separate personal Neon project list.
+(`still-brook-09634360`, resource `grove-coordination-efficient`), rather than a
+separate personal Neon project list. The previous `muddy-math-90157843` project
+is retained as a fenced archive after migration. The four Codex Cloud client
+Environment variables and endpoint stay the same. Neon Free includes
+[5 GB outgoing transfer per project per month](https://neon.com/docs/introduction/network-transfer);
+the new project supplies a fresh allowance, not unlimited transfer. See the
+[egress verification evidence](coordination-egress-receipt.json).

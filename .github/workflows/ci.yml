@@ -55,3 +55,13 @@ jobs:
       - name: Coordination acceptance (disposable repositories, no model calls)
         if: runner.os == 'Linux'
         run: python3 scripts/coordination_acceptance.py --binary target/debug/grove
+
+      - name: PostgreSQL coordination storage acceptance (isolated, no cloud credentials)
+        if: runner.os == 'Linux'
+        run: |
+          npm ci --prefix scripts/postgres-fixture --ignore-scripts
+          node scripts/postgres-fixture/server.mjs > /tmp/grove-sql-fixture.log 2>&1 &
+          grove_sql_pid=$!
+          trap 'kill "$grove_sql_pid"; cat /tmp/grove-sql-fixture.log' EXIT
+          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:45217/health
+          GROVE_TEST_SQL_ENDPOINT=http://127.0.0.1:45217 cargo test -p grove-cloud --lib --locked postgres_projection -- --ignored --nocapture

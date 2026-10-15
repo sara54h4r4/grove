@@ -1,0 +1,149 @@
+{
+  "date": "2026-10-15",
+  "old_project": "muddy-math-90157843",
+  "new_project": "still-brook-09634360",
+  "plan": "Neon Free through existing Vercel Marketplace integration",
+  "monthly_outgoing_allowance_bytes": 5000000000,
+  "old_observed_transfer_bytes": 4856282243,
+  "old_full_snapshot_sql_response_bytes": 4430582,
+  "neon_private_archive_replay": {
+    "source": "private production archive replayed in isolated test repository",
+    "model_calls": 0,
+    "heartbeat_db_bytes": 2150,
+    "cold_sync_db_bytes": 183670,
+    "warm_sync_db_bytes": 1863,
+    "clock_refresh_db_bytes": 1863
+  },
+  "isolated_postgres_acceptance": {
+    "bounded_history": [
+      {
+        "history_messages": 10,
+        "heartbeat_db_bytes": 1316,
+        "unchanged_sync_db_bytes": 6619,
+        "warm_sync_db_bytes": 314,
+        "clock_refresh_db_bytes": 314,
+        "header_scan_db_bytes": 7255
+      },
+      {
+        "history_messages": 1000,
+        "heartbeat_db_bytes": 1190,
+        "unchanged_sync_db_bytes": 6622,
+        "warm_sync_db_bytes": 314,
+        "clock_refresh_db_bytes": 314,
+        "header_scan_db_bytes": 82809
+      }
+    ],
+    "concurrent_same_key_effects": 1,
+    "concurrent_distinct_key_effects": 4,
+    "full_engine_equivalence": "passed",
+    "import_preserves_history_and_refuses_overwrite": true
+  },
+  "workspace_tests": {
+    "passed": 915,
+    "ignored_by_default": 2,
+    "clippy_all_targets": "passed",
+    "formatting": "passed",
+    "disposable_process_acceptance_assertions": 32
+  },
+  "production_migration": {
+    "status": "completed",
+    "source_exported_revision": 2858,
+    "destination_import_revision": 2859,
+    "source_legacy_writes_fenced": true,
+    "old_database_role_password_rotated": true,
+    "retired_database_credential_rejected": true,
+    "source_and_archive_retained": true,
+    "all_eight_tables_match_before_probes": true,
+    "rows_and_digests": [
+      [
+        "coord_claims",
+        "33",
+        "d7ca6585225547633f55f71a3ea90435"
+      ],
+      [
+        "coord_decision_acks",
+        "2",
+        "e24150f6c625a8504c2a4a9c8648f744"
+      ],
+      [
+        "coord_decisions",
+        "1",
+        "4b5cfa8650738ac350598aabd5f09ba3"
+      ],
+      [
+        "coord_events",
+        "845",
+        "cd995c42f20531e44357a6df3b3a4850"
+      ],
+      [
+        "coord_messages",
+        "271",
+        "a43bfd4c9c53a1fee423afc2cf856791"
+      ],
+      [
+        "coord_meta",
+        "1",
+        "178607af13c4475bc7b95675f240efe7"
+      ],
+      [
+        "coord_sessions",
+        "18",
+        "3904cb579c7553e8bc8a917dfb3e6284"
+      ],
+      [
+        "coord_transfers",
+        "10",
+        "1e540b60b9402282f1199322e396a89b"
+      ]
+    ],
+    "verification_sql_response_bytes": 1758,
+    "deployment_id": "dpl_8NbyVmTyj2fMZJzmFcD8Ca7c4pfo",
+    "deployment_source_sha": "11789ed978ca34d318c77cf04702736beb4d9e2a",
+    "canonical_endpoint": "https://grove-coordination.vercel.app/coord",
+    "client_environment_values_changed": false,
+    "staged_checks": {
+      "hello": "passed",
+      "retained_transfer_read": "passed",
+      "missing_credentials_http": 401,
+      "wrong_repository_http": 403,
+      "missing_operator_http": 403,
+      "malformed_request_http": 400
+    }
+  },
+  "measurement_limits": [
+    "SQL response body bytes are consumed application bytes, not exact billed wire transfer.",
+    "Vercel warm-instance reuse is not guaranteed; cold/context-changing requests cost more.",
+    "Project transfer meters may lag; a zero reported reading does not prove zero consumption.",
+    "Tests make zero model calls."
+  ],
+  "source_meter_at_cutover_bytes": 5019110183,
+  "ci": {
+    "head_sha": "11789ed978ca34d318c77cf04702736beb4d9e2a",
+    "linux_and_macos": "passed",
+    "workflow_run_id": 38752286477
+  },
+  "neon_postgres_acceptance": {
+    "bounded_history": [
+      {
+        "history_messages": 10,
+        "heartbeat_db_bytes": 1913,
+        "unchanged_sync_db_bytes": 7286,
+        "warm_sync_db_bytes": 699,
+        "clock_refresh_db_bytes": 699,
+        "header_scan_db_bytes": 7786
+      },
+      {
+        "history_messages": 100,
+        "heartbeat_db_bytes": 1582,
+        "unchanged_sync_db_bytes": 7289,
+        "warm_sync_db_bytes": 699,
+        "clock_refresh_db_bytes": 699,
+        "header_scan_db_bytes": 15955
+      }
+    ],
+    "concurrent_same_key_effects": 1,
+    "concurrent_distinct_key_effects": 4,
+    "full_engine_equivalence": "passed",
+    "import_preserves_history_and_refuses_overwrite": true
+  }
+}
