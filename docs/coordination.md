@@ -185,7 +185,7 @@ credentials for other repositories. Sharing a participant token trusts those
 participants to report their own session IDs; native identities are not
 cryptographically attested by Grove.
 
-For a database move, use `scripts/migrate_coordination.py` with explicit private
+For a move from the legacy snapshot store, use `scripts/migrate_coordination.py` with explicit private
 source/target/client env files and distinct project IDs. Export once to a new
 private archive path, initialize the empty destination with `coord --migrate`,
 and stage the deployment. Then `freeze` the source at the exported revision,
@@ -195,6 +195,9 @@ export a fresh archive and retry the fence. The trigger rejects legacy snapshot
 writes, including no-op writes, so old deployments cannot acknowledge divergent
 state. Import refuses to overwrite an active destination. The source snapshot
 and private archive are retained; this process deletes no coordination history.
+The exporter refuses an active version-2 row store: its archived snapshot is not
+a current backup. Future moves of a live row store need a complete Postgres
+backup or branch/project migration that includes all indexed rows and metadata.
 After cutover, retire the old deployment's database access to stop obsolete
 URLs from continuing to read the old snapshot. Do not roll back to a legacy
 writer after new writes: deploy a compatible row-store build against the new DB.

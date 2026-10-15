@@ -69,10 +69,17 @@ def main():
     repository = client["GROVE_REPOSITORY_ID"]
     archive_path = Path(args.archive)
     if args.action == "export":
+        state, _ = query(source_connection,
+                         "SELECT COALESCE(to_jsonb(g)->>'storage_version','1') FROM grove_coordination g WHERE repository_id=$1",
+                         [repository])
+        if not state["rows"] or int(state["rows"][0][0]) != 1:
+            raise RuntimeError("Legacy export requires a version-1 source; an active row store needs a current row-store backup")
         result, size = query(source_connection,
-                             "SELECT revision,snapshot FROM grove_coordination WHERE repository_id=$1",
+                             "SELECT revision,snapshot,COALESCE(to_jsonb(g)->>'storage_version','1') FROM grove_coordination g WHERE repository_id=$1",
                              [repository])
         row = result["rows"][0]
+        if int(row[2]) != 1:
+            raise RuntimeError("Source storage changed during export; no archive was written")
         snapshot = json.loads(row[1]) if isinstance(row[1], str) else row[1]
         if snapshot["version"] != 1 or set(snapshot["tables"]) != set(TABLES):
             raise RuntimeError("Unsupported source snapshot")
