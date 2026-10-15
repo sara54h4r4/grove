@@ -469,10 +469,14 @@ pub fn execute(
             )?;
             let cursor = after.unwrap_or(checkpoint);
             require(cursor >= 0, "invalid event cursor")?;
-            let high: i64 =
-                tx.query_row("SELECT COALESCE(MAX(seq),0) FROM coord_events", [], |r| {
-                    r.get(0)
-                })?;
+            // A cloud evaluation can contain a projected page of events. Its
+            // SQLite sequence is seeded from the authoritative global watermark.
+            let high: i64 = tx.query_row(
+                "SELECT MAX(COALESCE((SELECT MAX(seq) FROM coord_events),0),
+                    COALESCE((SELECT seq FROM sqlite_sequence WHERE name='coord_events'),0))",
+                [],
+                |r| r.get(0),
+            )?;
             require(cursor <= high, "cursor exceeds event high watermark")?;
             let mut stmt=tx.prepare("SELECT seq,kind,scope,payload,created_at FROM coord_events WHERE seq>?1 AND (recipient IS NULL OR recipient=?2 OR actor=?2) ORDER BY seq LIMIT 1001")?;
             let rows = stmt.query_map(params![cursor, session_id], |r| {

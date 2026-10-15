@@ -141,7 +141,55 @@ guide; this chat has no settings API for that environment. A private ignored
 
 Neon's selected Free resource advertises 1 GB storage and 100 CU-hours per project.
 Vercel uses the existing account's plan. Active polling consumes function requests,
-database compute and snapshot bandwidth; Grove itself never calls an LLM. Snapshot
-size/retention and contention are explicit milestone bounds, not production-scale
-claims. False alarms on independent real work, semantic transfer review by a real
+database compute and network transfer; Grove itself never calls an LLM. The
+snapshot backend described in this October 13 receipt is superseded by the
+October 15 row-store fix below. False alarms on independent real work, semantic transfer review by a real
 operator, unrelated-session discovery, and idle-model wakeup remain unmeasured.
+
+## Egress correction (2026-10-15)
+
+The old deployment fetched a 4,430,582-byte SQL response containing the complete
+repository snapshot on every operation, including unchanged polls. Cursor
+filtering occurred after that transfer. The replacement uses indexed Postgres
+rows, operation-specific reads, an atomic revision fence for changed rows/events,
+and a bounded sync cache validated against database versions and session clocks
+on every hit. Historical messages/events and the original archive are preserved.
+
+The workspace passed 915 tests (two ignored by default), strict all-target
+Clippy, formatting and the 32-assertion disposable-process acceptance. The new
+PostgreSQL acceptance is required separately in Linux CI and passes locally on
+PGlite 0.3.14 (Apache-2.0), an embedded PostgreSQL engine used only by tests. Its
+exact version and integrity are pinned in the fixture's package lock; it is not
+a production dependency and no upstream implementation was copied.
+
+The same acceptance passed on the fresh Neon project through the production SQL
+HTTP transport. It compares operation responses and every persisted row to the
+original SQLite state machine, and checks concurrent same-key retries, distinct
+concurrent sends, recipient ACKs, cursors/page/scan boundaries, decision authority,
+claim fencing/expiry, transfer policy, restart recovery, empty-only import and
+legacy-writer fencing. Acknowledged history grows to 1,000 messages of 22 KiB each
+plus their event copies in the local fixture without inflating hot reads.
+
+Replaying a private copy of the actual source data in an isolated Neon repository
+used 2,150 SQL response bytes for heartbeat, 183,670 for a cold unchanged sync,
+and 1,863 for warm sync, including heartbeat refresh. These are measured consumed
+SQL response bodies, not exact billed packets. Warm-instance reuse is not
+guaranteed by Vercel; first sync and context-changing calls still cost more.
+The test makes no model calls and does not impersonate a native session in the
+live repository. The [machine-readable receipt](coordination-egress-receipt.json)
+records migration and production verification separately.
+
+Reproduce without cloud credentials:
+
+```sh
+npm ci --prefix scripts/postgres-fixture --ignore-scripts
+node scripts/postgres-fixture/server.mjs
+# In another terminal:
+GROVE_TEST_SQL_ENDPOINT=http://127.0.0.1:45217 cargo test -p grove-cloud --lib --locked postgres_projection -- --ignored --nocapture
+```
+
+The fresh `grove-coordination-efficient` project belongs to the same Vercel
+Marketplace account and stays on Free. Neon documents 5 GB outgoing transfer per
+project per month, so this is a fresh allowance combined with lower consumption,
+not an unlimited database. The client endpoint, repository UUID and four ordinary
+runtime Environment variables are unchanged; database credentials stay server-side.

@@ -1,0 +1,57 @@
+{
+  "date": "2026-10-15",
+  "old_project": "muddy-math-90157843",
+  "new_project": "still-brook-09634360",
+  "plan": "Neon Free through existing Vercel Marketplace integration",
+  "monthly_outgoing_allowance_bytes": 5000000000,
+  "old_observed_transfer_bytes": 4856282243,
+  "old_full_snapshot_sql_response_bytes": 4430582,
+  "neon_private_archive_replay": {
+    "source": "private production archive replayed in isolated test repository",
+    "model_calls": 0,
+    "heartbeat_db_bytes": 2150,
+    "cold_sync_db_bytes": 183670,
+    "warm_sync_db_bytes": 1863,
+    "clock_refresh_db_bytes": 1863
+  },
+  "isolated_postgres_acceptance": {
+    "bounded_history": [
+      {
+        "history_messages": 10,
+        "heartbeat_db_bytes": 1316,
+        "unchanged_sync_db_bytes": 6619,
+        "warm_sync_db_bytes": 314,
+        "clock_refresh_db_bytes": 314,
+        "header_scan_db_bytes": 7255
+      },
+      {
+        "history_messages": 1000,
+        "heartbeat_db_bytes": 1190,
+        "unchanged_sync_db_bytes": 6622,
+        "warm_sync_db_bytes": 314,
+        "clock_refresh_db_bytes": 314,
+        "header_scan_db_bytes": 82809
+      }
+    ],
+    "concurrent_same_key_effects": 1,
+    "concurrent_distinct_key_effects": 4,
+    "full_engine_equivalence": "passed",
+    "import_preserves_history_and_refuses_overwrite": true
+  },
+  "workspace_tests": {
+    "passed": 915,
+    "ignored_by_default": 2,
+    "clippy_all_targets": "passed",
+    "formatting": "passed",
+    "disposable_process_acceptance_assertions": 32
+  },
+  "production_migration": {
+    "status": "pending"
+  },
+  "measurement_limits": [
+    "SQL response body bytes are consumed application bytes, not exact billed wire transfer.",
+    "Vercel warm-instance reuse is not guaranteed; cold/context-changing requests cost more.",
+    "Project transfer meters may lag; a zero reported reading does not prove zero consumption.",
+    "Tests make zero model calls."
+  ]
+}

@@ -26,6 +26,7 @@ mutants.out.old/
 .agents/
 skills-lock.json
 scripts/__pycache__/
+scripts/postgres-fixture/node_modules/
 
 # Current coordination guide and review evidence; older ignored docs stay ignored.
 !docs/
@@ -36,3 +37,4 @@ docs/*
 !docs/coordination-local-receipt.json
 !docs/coordination-hosted-receipt.json
 !docs/coordination-codex-receipt.json
+!docs/coordination-egress-receipt.json

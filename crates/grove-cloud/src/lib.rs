@@ -1,7 +1,8 @@
-//! Stateless Vercel backend. Postgres commits the shared state with an atomic
-//! revision compare-and-swap; the exact local coordination engine evaluates it.
-//! This bounded milestone avoids two independently implemented inbox/policy
-//! stores. Native Postgres tables can replace snapshot persistence later.
+//! Stateless Vercel backend. Indexed Postgres rows own durable state. A bounded
+//! working set is evaluated by the local engine, then changed rows and events
+//! commit together behind an atomic revision fence. History stays in Postgres.
+mod cache;
+mod storage;
 use grove_daemon::{
     coordination,
     coordination_snapshot::{self, Snapshot},
@@ -9,7 +10,11 @@ use grove_daemon::{
 use grove_lib::coordination::CoordCommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+pub use storage::Archive;
 
 pub const MAX_REQUEST_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
@@ -17,6 +22,37 @@ pub const MAX_RESPONSE_BYTES: usize = 4_194_304;
 const MAX_CAS_ATTEMPTS: u32 = 12;
 
 type Result<T> = std::result::Result<T, String>;
+
+struct DbReply {
+    data: Value,
+    bytes: usize,
+}
+
+#[derive(Default, Serialize)]
+struct RequestMetrics {
+    operation: String,
+    attempts: u32,
+    db_queries: usize,
+    db_response_bytes: usize,
+    projected_rows: usize,
+    projection_cache_hits: usize,
+    ok: bool,
+}
+
+fn integer(value: &Value) -> Result<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|v| v.parse().ok()))
+        .ok_or_else(|| "invalid coordination state integer".into())
+}
+
+fn decoded<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
+    match value.as_str() {
+        Some(raw) => serde_json::from_str(raw),
+        None => serde_json::from_value(value.clone()),
+    }
+    .map_err(|_| "invalid stored coordination rows".into())
+}
 
 fn neon_http_endpoint(connection: &str) -> Result<reqwest::Url> {
     let parsed =
@@ -49,6 +85,7 @@ pub struct Config {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     connection: reqwest::header::HeaderValue,
+    cache: Mutex<cache::Cache>,
 }
 
 impl Config {
@@ -61,12 +98,20 @@ impl Config {
         if token.len() < 24 {
             return Err("GROVE_COORD_TOKEN must contain at least 24 bytes".into());
         }
-        let key = if migration {
+        let fallback = if migration {
             "DATABASE_URL_UNPOOLED"
         } else {
             "DATABASE_URL"
         };
-        let connection = std::env::var(key).map_err(|_| format!("{key} is missing"))?;
+        let preferred = format!("GROVE_COORD_{fallback}");
+        let connection = match std::env::var(&preferred) {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) => return Err(format!("{preferred} is empty")),
+            Err(std::env::VarError::NotPresent) => {
+                std::env::var(fallback).map_err(|_| format!("{fallback} is missing"))?
+            }
+            Err(_) => return Err("invalid database configuration".into()),
+        };
         let endpoint = neon_http_endpoint(&connection)?;
         let mut connection = reqwest::header::HeaderValue::from_str(&connection)
             .map_err(|_| "invalid database connection header")?;
@@ -83,6 +128,7 @@ impl Config {
             client,
             endpoint,
             connection,
+            cache: Mutex::new(cache::Cache::default()),
         })
     }
     pub fn authenticate(
@@ -100,7 +146,7 @@ impl Config {
         }
         Ok(operator)
     }
-    async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Value> {
+    async fn query_measured(&self, sql: &str, params: Vec<Value>) -> Result<DbReply> {
         // Neon's official SQL-over-HTTP protocol; all SQL is static, values bound.
         let mut response = self
             .client
@@ -125,11 +171,83 @@ impl Config {
             .map_err(|_| "database response unavailable")?
         {
             if bytes.len() + chunk.len() > MAX_SNAPSHOT_BYTES + 1_048_576 {
-                return Err("coordination database response exceeds milestone size bound".into());
+                return Err("coordination database response exceeds size bound".into());
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|_| "invalid coordination database response".into())
+        Ok(DbReply {
+            data: serde_json::from_slice(&bytes)
+                .map_err(|_| "invalid coordination database response")?,
+            bytes: bytes.len(),
+        })
+    }
+    async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Value> {
+        self.query_measured(sql, params)
+            .await
+            .map(|reply| reply.data)
+    }
+    async fn working_set(
+        &self,
+        command: &CoordCommand,
+        key: &str,
+        metrics: &mut RequestMetrics,
+    ) -> Result<(i64, i64, i64, Snapshot)> {
+        let cached = if matches!(command, CoordCommand::Sync { .. }) {
+            self.cache.lock().ok().and_then(|mut cache| cache.get(key))
+        } else {
+            None
+        };
+        if let Some(mut cached) = cached {
+            let state = self
+                .query_measured(storage::CHECK, vec![json!(self.repository_id)])
+                .await?;
+            metrics.db_queries += 1;
+            metrics.db_response_bytes += state.bytes;
+            let row = state.data["rows"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .ok_or("coordination schema/repository is not initialized")?;
+            let (revision, high, context) =
+                (integer(&row[0])?, integer(&row[1])?, integer(&row[2])?);
+            let checkpoint_owner = match command {
+                CoordCommand::Sync {
+                    session_id,
+                    after: None,
+                    ..
+                } => Some(session_id.as_str()),
+                _ => None,
+            };
+            if high == cached.high
+                && context == cached.context
+                && cache::refresh(&mut cached.snapshot, &row[3], checkpoint_owner)?
+            {
+                metrics.projection_cache_hits += 1;
+                return Ok((revision, high, context, cached.snapshot));
+            }
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(key);
+            }
+        }
+        let state = self
+            .query_measured(storage::LOAD, vec![json!(self.repository_id), json!(key)])
+            .await?;
+        metrics.db_queries += 1;
+        metrics.db_response_bytes += state.bytes;
+        let row = state.data["rows"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or("coordination schema/repository is not initialized")?;
+        Ok((
+            integer(&row[0])?,
+            integer(&row[1])?,
+            integer(&row[2])?,
+            decoded(&row[3])?,
+        ))
+    }
+    fn remember(&self, key: &str, context: i64, high: i64, snapshot: Snapshot) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(key.to_string(), context, high, snapshot);
+        }
     }
     /// Run once after environment verification; migrations are tracked source.
     pub async fn migrate(&self) -> Result<()> {
@@ -138,66 +256,172 @@ impl Config {
             vec![],
         )
         .await?;
+        self.query(
+            include_str!("../../../hosting/migrations/002-coordination-rows.sql"),
+            vec![],
+        )
+        .await?;
+        self.query(
+            include_str!("../../../hosting/migrations/003-coordination-row-version.sql"),
+            vec![],
+        )
+        .await?;
+        self.query(
+            include_str!("../../../hosting/migrations/004-fence-legacy-writes.sql"),
+            vec![],
+        )
+        .await?;
+        self.query(
+            include_str!("../../../hosting/migrations/005-coordination-context-version.sql"),
+            vec![],
+        )
+        .await?;
+        self.query("CREATE OR REPLACE TRIGGER grove_coordination_legacy_fence BEFORE UPDATE OF snapshot ON grove_coordination FOR EACH ROW EXECUTE FUNCTION grove_coordination_protect_archive()",vec![]).await?;
+        for sql in [
+            "CREATE UNIQUE INDEX IF NOT EXISTS grove_rows_event_seq ON grove_coordination_rows(repository_id,event_seq) WHERE table_name='coord_events'",
+            "CREATE INDEX IF NOT EXISTS grove_rows_inbox ON grove_coordination_rows(repository_id,recipient,acked_at,created_at) WHERE table_name='coord_messages'",
+            "CREATE UNIQUE INDEX IF NOT EXISTS grove_rows_dedup ON grove_coordination_rows(repository_id,sender,request_key) WHERE table_name='coord_messages'",
+            "CREATE INDEX IF NOT EXISTS grove_rows_decisions ON grove_coordination_rows(repository_id,(data->>0),((data->>1)::bigint)) WHERE table_name='coord_decisions'",
+        ] {
+            self.query(sql, vec![]).await?;
+        }
         self.query("INSERT INTO grove_coordination(repository_id) VALUES($1) ON CONFLICT(repository_id) DO NOTHING",vec![json!(self.repository_id)]).await?;
+        self.query(storage::UPGRADE, vec![json!(self.repository_id)])
+            .await?;
+        Ok(())
+    }
+    /// Operator CLI only: imports into an empty destination and retains the
+    /// archive. There is no overwrite/delete flag or remotely exposed tool.
+    pub async fn import_snapshot(&self, archive: Archive) -> Result<()> {
+        if archive.repository_id != self.repository_id || archive.revision < 0 {
+            return Err("archive repository/revision mismatch".into());
+        }
+        let (snapshot, _) = evaluate(
+            &self.repository_id,
+            Some(&archive.snapshot),
+            CoordCommand::Hello,
+            false,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
+        let high = snapshot.tables["coord_events"]
+            .iter()
+            .filter_map(|row| row.first().and_then(Value::as_i64))
+            .max()
+            .unwrap_or(0);
+        let raw = serde_json::to_string(&snapshot).map_err(|_| "cannot encode archive")?;
+        if raw.len() > MAX_SNAPSHOT_BYTES {
+            return Err("archive exceeds import size bound".into());
+        }
+        let result = self
+            .query(
+                storage::IMPORT,
+                vec![
+                    json!(self.repository_id),
+                    json!(raw),
+                    json!(high.to_string()),
+                    json!(archive.revision.to_string()),
+                ],
+            )
+            .await?;
+        if result["rows"].as_array().is_none_or(Vec::is_empty) {
+            return Err("snapshot import requires an initialized, empty destination".into());
+        }
         Ok(())
     }
     pub async fn coordinate(self: &Arc<Self>, envelope: Envelope, operator: bool) -> Result<Value> {
+        let mut metrics = RequestMetrics {
+            operation: serde_json::to_value(&envelope.command)
+                .ok()
+                .and_then(|v| v["op"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into()),
+            ..RequestMetrics::default()
+        };
+        let result = self
+            .coordinate_inner(envelope, operator, &mut metrics, None)
+            .await;
+        metrics.ok = result.is_ok();
+        // Names/counts only: never bodies, IDs, SQL text, headers or credentials.
+        eprintln!(
+            "grove_coord {}",
+            serde_json::to_string(&metrics).unwrap_or_else(|_| "metrics unavailable".into())
+        );
+        result
+    }
+    async fn coordinate_inner(
+        self: &Arc<Self>,
+        envelope: Envelope,
+        operator: bool,
+        metrics: &mut RequestMetrics,
+        now: Option<i64>,
+    ) -> Result<Value> {
         if envelope.repository_id != self.repository_id {
             return Err("repository identity mismatch".into());
         }
+        if let CoordCommand::Sync { limit, after, .. } = &envelope.command {
+            if *limit == 0 || *limit > grove_lib::coordination::MAX_PAGE {
+                return Err("limit must be 1..100".into());
+            }
+            if after.is_some_and(|v| v < 0) {
+                return Err("invalid event cursor".into());
+            }
+        }
+        let command_json = serde_json::to_string(&envelope.command)
+            .map_err(|_| "cannot encode coordination command")?;
+        let cacheable = matches!(envelope.command, CoordCommand::Sync { .. });
         for attempt in 0..MAX_CAS_ATTEMPTS {
-            let state = self
-                .query(
-                    "SELECT revision,snapshot FROM grove_coordination WHERE repository_id=$1",
-                    vec![json!(self.repository_id)],
-                )
+            metrics.attempts += 1;
+            let (revision, high, context, snapshot) = self
+                .working_set(&envelope.command, &command_json, metrics)
                 .await?;
-            let row = state["rows"]
-                .as_array()
-                .and_then(|r| r.first())
-                .ok_or("coordination schema/repository is not initialized")?;
-            let revision = row[0]
-                .as_i64()
-                .or_else(|| row[0].as_str().and_then(|v| v.parse().ok()))
-                .ok_or("invalid coordination state revision")?;
-            let snapshot: Option<Snapshot> = if row[1].is_null() {
-                None
-            } else if let Some(raw) = row[1].as_str() {
-                Some(
-                    serde_json::from_str(raw)
-                        .map_err(|_| "invalid stored coordination snapshot")?,
-                )
-            } else {
-                Some(
-                    serde_json::from_value(row[1].clone())
-                        .map_err(|_| "invalid stored coordination snapshot")?,
-                )
-            };
+            metrics.projected_rows += snapshot.tables.values().map(Vec::len).sum::<usize>();
+            let before = snapshot.clone();
             let command = envelope.command.clone();
             let repo = self.repository_id.clone();
             let evaluated = tokio::task::spawn_blocking(move || {
-                evaluate(
+                evaluate_projected(
                     &repo,
-                    snapshot.as_ref(),
+                    Some(&snapshot),
                     command,
                     operator,
-                    chrono::Utc::now().timestamp_millis(),
+                    now.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+                    Some(high),
                 )
             })
             .await
             .map_err(|_| "coordination engine unavailable")?;
-            let (snapshot, result) = evaluated?;
-            let raw =
-                serde_json::to_string(&snapshot).map_err(|_| "cannot encode coordination state")?;
-            if raw.len() > MAX_SNAPSHOT_BYTES {
-                return Err("coordination state exceeds 16 MiB milestone bound; export/archive before adding more state".into());
+            let (snapshot, result, next_high) = evaluated?;
+            let patch = storage::changes(&before, &snapshot)?;
+            if patch.is_empty() {
+                // The SELECT is the linearization point for unchanged reads.
+                if cacheable {
+                    self.remember(&command_json, context, next_high, snapshot);
+                }
+                return Ok(result);
             }
-            let committed=self.query("UPDATE grove_coordination SET snapshot=$2::jsonb,revision=revision+1,updated_at=now() WHERE repository_id=$1 AND revision=$3::bigint RETURNING revision",
-                vec![json!(self.repository_id),json!(raw),json!(revision.to_string())]).await?;
-            if committed["rows"]
+            let changes_context = storage::changes_context(&before, &patch)?;
+            let patch = serde_json::to_string(&patch).map_err(|_| "cannot encode row changes")?;
+            let committed = self
+                .query_measured(
+                    storage::COMMIT,
+                    vec![
+                        json!(self.repository_id),
+                        json!(revision.to_string()),
+                        json!(patch),
+                        json!(next_high.to_string()),
+                        json!(changes_context),
+                    ],
+                )
+                .await?;
+            metrics.db_queries += 1;
+            metrics.db_response_bytes += committed.bytes;
+            if committed.data["rows"]
                 .as_array()
                 .is_some_and(|rows| !rows.is_empty())
             {
+                if cacheable {
+                    let new_context = integer(&committed.data["rows"][0][1])?;
+                    self.remember(&command_json, new_context, next_high, snapshot);
+                }
                 return Ok(result);
             }
             // A concurrent request won. Re-evaluate from its committed state;
@@ -215,6 +439,18 @@ pub fn evaluate(
     operator: bool,
     now: i64,
 ) -> Result<(Snapshot, Value)> {
+    let (snapshot, response, _) = evaluate_projected(repo, snapshot, command, operator, now, None)?;
+    Ok((snapshot, response))
+}
+
+fn evaluate_projected(
+    repo: &str,
+    snapshot: Option<&Snapshot>,
+    command: CoordCommand,
+    operator: bool,
+    now: i64,
+    high: Option<i64>,
+) -> Result<(Snapshot, Value, i64)> {
     let mut conn =
         rusqlite::Connection::open_in_memory().map_err(|_| "cannot create coordination engine")?;
     coordination::migrate(&conn).map_err(|_| "cannot initialize coordination engine")?;
@@ -226,6 +462,23 @@ pub fn evaluate(
             [repo],
         )
         .map_err(|_| "cannot initialize repository identity")?;
+    }
+    if let Some(high) = high {
+        let existing: i64 = conn
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM coord_events", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| "cannot read event watermark")?;
+        if high < existing {
+            return Err("invalid global event watermark".into());
+        }
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='coord_events'", [])
+            .map_err(|_| "cannot initialize event sequence")?;
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name,seq) VALUES('coord_events',?1)",
+            [high],
+        )
+        .map_err(|_| "cannot initialize event sequence")?;
     }
     let mut command = command;
     match &mut command {
@@ -249,8 +502,19 @@ pub fn evaluate(
         return Err("coordination response exceeds size bound; reduce scope/page".into());
     }
     let snapshot = coordination_snapshot::export(&conn).map_err(|e| e.to_string())?;
-    Ok((snapshot, response))
+    let high = conn
+        .query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='coord_events'),0)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| "cannot read event sequence")?;
+    Ok((snapshot, response, high))
 }
+
+#[cfg(test)]
+#[path = "postgres_tests.rs"]
+mod postgres_tests;
 
 #[cfg(test)]
 mod tests {
