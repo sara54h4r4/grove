@@ -193,3 +193,14 @@ Marketplace account and stays on Free. Neon documents 5 GB outgoing transfer per
 project per month, so this is a fresh allowance combined with lower consumption,
 not an unlimited database. The client endpoint, repository UUID and four ordinary
 runtime Environment variables are unchanged; database credentials stay server-side.
+
+Production cutover preserved revision 2858 from the source, imported it at
+revision 2859 in `still-brook-09634360`, and compared all eight table counts and
+content digests before probing. The canonical endpoint now resolves to
+`dpl_8NbyVmTyj2fMZJzmFcD8Ca7c4pfo` (source `11789ed978ca34d318c77cf04702736beb4d9e2a`).
+The old source remains readable through the connected account as a fenced
+archive. Its application role password was rotated, and both the retired SQL
+credential and the old deployment's ability to read that database were tested
+and rejected. The new database remains healthy. Initial production logs measured
+1,941-byte warm syncs and approximately 2.2 KB heartbeats. Linux and macOS CI both
+passed the implementation head, including the required PostgreSQL acceptance.
