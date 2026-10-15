@@ -108,7 +108,9 @@
       "wrong_repository_http": 403,
       "missing_operator_http": 403,
       "malformed_request_http": 400
-    }
+    },
+    "obsolete_deployment_database_read_rejected": true,
+    "source_archive_readable_via_connected_account_after_rotation": true
   },
   "measurement_limits": [
     "SQL response body bytes are consumed application bytes, not exact billed wire transfer.",
@@ -120,7 +122,10 @@
   "ci": {
     "head_sha": "11789ed978ca34d318c77cf04702736beb4d9e2a",
     "linux_and_macos": "passed",
-    "workflow_run_id": 38752286477
+    "workflow_run_id": 38752286477,
+    "latest_reviewed_head_sha": "976da938de81c83242ccfb4b24156c3eff0867dc",
+    "latest_linux_and_macos": "passed",
+    "latest_workflow_run_id": 38753596408
   },
   "neon_postgres_acceptance": {
     "bounded_history": [
@@ -145,5 +150,95 @@
     "concurrent_distinct_key_effects": 4,
     "full_engine_equivalence": "passed",
     "import_preserves_history_and_refuses_overwrite": true
+  },
+  "operator_guard": {
+    "legacy_export_refuses_active_row_store": true,
+    "verified_against_new_project": true,
+    "archive_created": false,
+    "full_snapshot_downloaded": false
+  },
+  "merged_pull_request": "https://github.com/sara54h4r4/grove/pull/2",
+  "merge_commit_sha": "629bf8b92ddf7d68ba97191a509d8ed8107f941d",
+  "production_observation": {
+    "status": "passed",
+    "started_at": "2026-10-15T14:36:34.333169+00:00",
+    "duration_target_seconds": 900,
+    "model_calls": 0,
+    "session_kind": "explicit synthetic transport fixture on isolated IWS worktree",
+    "request_budget": 64,
+    "client_response_budget_bytes": 12582912,
+    "fixture_marked_stopped": true,
+    "tracked_iws_files_and_branch_unchanged": true,
+    "ended_at": "2026-10-15T14:51:35.194681+00:00",
+    "elapsed_seconds": 900.86,
+    "client_response_bytes": 5027403,
+    "successful_requests": 51,
+    "all_original_eight_table_counts_and_digests_unchanged": true,
+    "synthetic_session_stopped_in_database": true,
+    "runtime_metrics": {
+      "request_metrics_count": 51,
+      "total_sql_response_body_bytes": 795984,
+      "operations": {
+        "heartbeat": {
+          "requests": 16,
+          "db_queries": 32,
+          "sql_response_body_bytes": 35424,
+          "min_request_db_bytes": 2214,
+          "max_request_db_bytes": 2214,
+          "cache_hits": 0,
+          "cas_attempts": 16,
+          "failed_requests": 0
+        },
+        "sync": {
+          "requests": 32,
+          "db_queries": 33,
+          "sql_response_body_bytes": 655811,
+          "min_request_db_bytes": 1941,
+          "max_request_db_bytes": 413224,
+          "cache_hits": 30,
+          "cas_attempts": 32,
+          "failed_requests": 0
+        },
+        "checkpoint": {
+          "requests": 1,
+          "db_queries": 2,
+          "sql_response_body_bytes": 2212,
+          "min_request_db_bytes": 2212,
+          "max_request_db_bytes": 2212,
+          "cache_hits": 0,
+          "cas_attempts": 1,
+          "failed_requests": 0
+        },
+        "register": {
+          "requests": 1,
+          "db_queries": 2,
+          "sql_response_body_bytes": 101664,
+          "min_request_db_bytes": 101664,
+          "max_request_db_bytes": 101664,
+          "cache_hits": 0,
+          "cas_attempts": 1,
+          "failed_requests": 0
+        },
+        "hello": {
+          "requests": 1,
+          "db_queries": 1,
+          "sql_response_body_bytes": 873,
+          "min_request_db_bytes": 873,
+          "max_request_db_bytes": 873,
+          "cache_hits": 0,
+          "cas_attempts": 1,
+          "failed_requests": 0
+        }
+      },
+      "new_project_meter": {
+        "id": "still-brook-09634360",
+        "data_transfer_bytes": 0,
+        "updated_at": "2026-10-15T14:47:46Z",
+        "period_end": "2026-11-01T00:00:00Z"
+      },
+      "meter_observed_at": "2026-10-15 14:52:20 UTC",
+      "meter_caveat": "Neon reported zero while application metrics measured real reads; the delayed meter cannot establish exact billed transfer.",
+      "old_fixed_snapshot_single_attempt_estimate_bytes": 225959682
+    }
   }
 }

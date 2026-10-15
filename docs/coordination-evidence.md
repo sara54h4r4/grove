@@ -204,3 +204,16 @@ credential and the old deployment's ability to read that database were tested
 and rejected. The new database remains healthy. Initial production logs measured
 1,941-byte warm syncs and approximately 2.2 KB heartbeats. Linux and macOS CI both
 passed the implementation head, including the required PostgreSQL acceptance.
+
+The bounded production observation lasted 900.86 seconds and completed 51
+operations with no failures: registration, 32 syncs, 16 heartbeats, a checkpoint
+and Hello. Runtime metrics recorded **795,984 SQL response body bytes** in total,
+including the initial history/context reads; 30 syncs used the validated cache.
+Warm sync stayed at 1,941 bytes and heartbeat at 2,214 bytes. At the old fixed
+snapshot size and one attempt per call, 51 operations would read approximately
+226 MB; that is a counterfactual estimate, not a historical billing measurement.
+Neon's new-project meter still reported zero at the final read despite these
+measured reads, so exact billed transfer and sustained independent-agent workload
+cost remain unmeasured. After the window, all original eight table counts and
+content digests still matched the source, the synthetic session was marked
+stopped, and tracked IWS files and its validation branch were unchanged.
