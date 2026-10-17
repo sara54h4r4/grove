@@ -16,6 +16,7 @@ use crate::commands::ci::CiAction;
 #[derive(Parser, Debug)]
 #[command(
     name = "grove",
+    version,
     about = "Git worktree workspace manager with conflict intelligence"
 )]
 pub struct CliArgs {

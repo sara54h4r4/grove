@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "grove"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "grove-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "chrono",
@@ -1795,6 +1795,7 @@ dependencies = [
  "crossterm",
  "futures",
  "gix",
+ "grove-daemon",
  "grove-lib",
  "reqwest",
  "rmcp",
@@ -1812,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "grove-cloud"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "grove-daemon",
@@ -1829,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "grove-daemon"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "futures",
@@ -1855,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "grove-lib"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "chrono",

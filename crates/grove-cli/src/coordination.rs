@@ -22,6 +22,9 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[path = "coordination_http.rs"]
+mod http;
+
 #[derive(clap::Subcommand, Debug)]
 pub enum CoordAction {
     /// Print the repository's persistent identity and transport capabilities
@@ -308,6 +311,7 @@ impl Transport {
         }
     }
     pub async fn call(&self, command: CoordCommand) -> Result<Value> {
+        let retry_safe = http::retry_safe(&command);
         let approver =
             if command.operator_only() {
                 Some(std::env::var("GROVE_COORD_APPROVER_TOKEN").map_err(
@@ -344,31 +348,10 @@ impl Transport {
                     v.set_sensitive(true);
                     request = request.header("x-grove-approver-token", v);
                 }
-                // Never print a reqwest error containing an endpoint or header.
-                let mut response = request.send().await.map_err(
-                    |_| "coordination service unavailable; retry using the same deduplication key",
-                )?;
-                if !response.status().is_success() {
-                    return Err(format!(
-                        "coordination service rejected request (HTTP {})",
-                        response.status().as_u16()
-                    )
-                    .into());
-                }
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|_| "coordination response unavailable")?
-                {
-                    if bytes.len() + chunk.len() > 4_194_304 {
-                        return Err("coordination response exceeds size limit".into());
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                unwrap_response(
-                    serde_json::from_slice(&bytes).map_err(|_| "invalid coordination response")?,
-                )
+                let request = request
+                    .build()
+                    .map_err(|_| "cannot encode coordination request")?;
+                http::call(client, request, retry_safe).await
             }
         }
     }
