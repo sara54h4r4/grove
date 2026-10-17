@@ -38,10 +38,13 @@ script's current IWS dependency installation. Rust 1.99.0 was used for verificat
 the client build also needs a C compiler.
 
 ```sh
-cargo build -p grove --locked
-mkdir -p "$HOME/.local/bin"
-install -m 755 target/debug/grove "$HOME/.local/bin/grove"
+bash scripts/install-cloud-client.sh
 ```
+
+The installer requires a clean reviewed checkout, Rust/Cargo, a C compiler and
+Python 3. It builds the client, atomically replaces `$HOME/.local/bin/grove`, and
+prints its version and source commit. It preserves the existing runtime variables
+and proxy/CA configuration.
 
 Add **all four values as Environment variables** in the Codex Cloud environment,
 so they are available during both setup and agent execution. This retains the
@@ -119,6 +122,59 @@ Cloud instance. Installing Grove alone does not register sessions or connect cha
 
 The [environment editing-agent prompt](codex-cloud-agent-prompt.txt) supplies the
 handoff, scope, configuration, and acceptance checklist without credential values.
+
+### Upgrading an installed Cloud client
+
+Grove 0.4.2 adds bounded transient-failure recovery and safe HTTP diagnostics to
+both CLI and MCP. Pulling source alone does not replace an installed binary.
+From a clean Grove tools checkout on `main`, outside the coding project:
+
+```sh
+git pull --ff-only
+bash scripts/install-cloud-client.sh
+"$HOME/.local/bin/grove" --version
+"$HOME/.local/bin/grove" --json coord hello
+```
+
+The version must report `grove 0.4.2`. CLI wrappers that launch this path for each
+call use the new binary on their next invocation. Existing MCP processes keep
+running their old executable until the Grove connection/process is restarted;
+start a fresh Cloud task if reconnecting is unavailable. Record the installed
+path and source SHA. Use the installer in the existing setup/maintenance script
+and refresh the environment cache so future tasks get the update too. Other
+running Cloud tasks need the same client installation independently. This client
+update uses the existing endpoint and four ordinary runtime Environment variables.
+
+Give a Python wrapper at least 60 seconds per CLI invocation. Grove makes at most
+four attempts within a 45-second total budget, with 1/2/4-second backoff plus up
+to 250 ms jitter. It retries timeouts/connection/body-read failures and HTTP
+408/429/500/502/503/504 only for Hello, sync, heartbeat, checkpoint, keyed send,
+message/decision ACK and get-transfer. Every attempt preserves the encoded
+request and existing deduplication key. Registration, proposals, approvals,
+claims/renewals/releases and transfer mutations are not automatically replayed;
+after an uncertain result, inspect their state before deciding what to do next.
+Authentication/validation errors and application-level rejections are returned
+immediately.
+
+`Retry-After` seconds and HTTP dates are honored. A cooldown longer than the
+remaining call budget is returned immediately in `retry_after_seconds`, without
+an early retry. The owning poller must honor that cooldown across invocations.
+After an exhausted call, keep one non-overlapping poller and back off whole-call
+retries toward 5/10/20/40/60 seconds with jitter; reset after success. Retain queued
+messages and their keys. ACK only processed messages and advance checkpoints
+only after successfully processing a served cursor. A failed heartbeat grants
+no extension to a claim's lease.
+
+Recovery emits one `grove_coord_recovery` JSON record to stderr. A failed CLI
+invocation still emits exactly one JSON error to stderr, with safe diagnostics
+and prior retry metadata appended inside its existing `error` string. Capture
+stderr separately from success JSON stdout or MCP protocol output. Diagnostics contain UTC
+time, attempt, failure category/status and, when present and safe, `x-vercel-id`,
+`x-vercel-error`, numeric retry timing and a limited server hint. Credentials,
+request/response bodies, URLs and arbitrary headers are excluded. These hints
+help correlate a failure; a 503 or `server=envoy` alone does not identify the
+failing hop. For simultaneous failures on other sites, collect evidence from the
+affected Cloud environment and compare with a control on a different provider.
 
 Give agents this short workflow as an explicit task instruction or optional
 project guidance: register the real native ID/task/scope/acceptance at task start;

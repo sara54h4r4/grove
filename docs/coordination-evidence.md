@@ -217,3 +217,36 @@ measured reads, so exact billed transfer and sustained independent-agent workloa
 cost remain unmeasured. After the window, all original eight table counts and
 content digests still matched the source, the synthetic session was marked
 stopped, and tracked IWS files and its validation branch were unchanged.
+
+## Transient client failures (2026-10-17)
+
+Grove 0.4.2 adds bounded retry/backoff to the shared CLI/MCP HTTP transport. It
+replays only operations with safe repeat semantics, preserving the original
+encoded request and deduplication key. Up to four attempts fit within a
+45-second budget. Transient HTTP/transport failures retain safe UTC/status/
+request-ID diagnostics; authentication, validation and application errors are
+not retried. `Retry-After` seconds and HTTP dates constrain retry timing. A
+longer cooldown is returned to the owning poller. A failed CLI call keeps one
+JSON error on stderr; successful recovery emits one diagnostic JSON record on
+stderr while stdout retains the original success/MCP protocol contract.
+
+The workspace passed **926 tests, two ignored**, strict all-target Clippy and
+formatting. Eleven new focused tests cover transient status recovery, exhausted
+attempt/deadline budgets, cooldowns, excluded operations and credential redaction
+including retry history. Tests using the real SQLite command engine commit a
+send before returning a simulated 503 or withholding its response until timeout;
+recovery returns the existing message with one durable message effect.
+
+Separate real-process CLI and official MCP tests inject a loopback 503, then
+verify successful recovery, identical replay, clean JSON/protocol streams and
+safe stderr diagnostics. Authentication fails once without retry, and exhausted
+CLI retries still produce one parseable JSON error. The existing 32-assertion
+disposable coordination acceptance also passes. These fixtures use no model
+calls or production writes. They validate resilience; they do not establish the
+cause of the reported Editorial environment outage.
+
+The Cloud installer builds a reviewed clean tools checkout and atomically
+replaces the installed executable. See the [upgrade instructions](coordination.md#upgrading-an-installed-cloud-client).
+Pulling source alone leaves existing executables unchanged. CLI wrappers use
+the replacement on their next invocation; long-lived MCP processes need a
+reconnection, and future Cloud tasks need refreshed setup/cache state.
