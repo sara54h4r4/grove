@@ -36,6 +36,8 @@ MariaDB 11.4; it is not evidence of the Bluehost account's configuration.
    directory inside its own website root. For an addon domain with a different
    document root, adjust the single `$private` path in `index.php` to the actual
    private directory. The PHP process needs read access to that directory.
+   Public PHP/`.htaccess` files should be mode 0644; private configuration
+   should be 0600 and the private directory 0700. The ZIP supplies these modes.
 3. For a generic ZIP, copy `.grove/config.example.php` to `.grove/config.php`.
    Set the new database name, database username and database password there.
    Keep the existing Grove repository UUID. Generate a new **backend-only**

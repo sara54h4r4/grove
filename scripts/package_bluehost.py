@@ -20,9 +20,13 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     with zipfile.ZipFile(args.output, "x", compression=zipfile.ZIP_DEFLATED) as output:
+        for directory, mode in ((".grove/", 0o40700), ("public_html/grove-store/", 0o40755)):
+            info = zipfile.ZipInfo(directory)
+            info.external_attr = (mode << 16) | 0x10
+            output.writestr(info, b"")
         for source, target in FILES.items():
             info = zipfile.ZipInfo(target)
-            info.external_attr = 0o100600 << 16
+            info.external_attr = (0o100644 if target.startswith("public_html/") else 0o100600) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             output.writestr(info, (ROOT / source).read_bytes())
     print(f"Packaged {len(FILES)} reviewed source files: {args.output}")
