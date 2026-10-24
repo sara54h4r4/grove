@@ -4,6 +4,11 @@ This is the current guide for the Codex coordination milestone on `main`. It wor
 with any Git project; the first hosted instance is pinned to the IWS repository.
 Historical activity and Codex adapter documents describe earlier designs.
 
+For an existing PHP/MySQL hosting plan, the [Bluehost setup guide](coordination-bluehost.md)
+provides a store adapter that preserves the Vercel endpoint, adds bounded history
+cleanup and avoids Neon's database transfer allowance. It needs a hosted
+installation and verified cutover before an existing deployment uses it.
+
 ## What agents get
 
 `grove mcp --repo /absolute/project` exposes twelve official MCP tools for

@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-24",
+  "fixture": "PHP 8.3 and MariaDB 11.4, isolated Docker network",
+  "model_calls": 0,
+  "production_writes": 0,
+  "live_cutover": "pending Bluehost installation",
+  "bluehost_receipt": {
+    "php_mysql_engine_equivalence": "passed",
+    "concurrent_same_key_effects": 1,
+    "concurrent_distinct_key_effects": 4,
+    "historical_sessions": 200,
+    "historical_8kb_events": 1003,
+    "cold_sync_db_bytes": 127660,
+    "warm_sync_db_bytes": 57,
+    "clock_delta_db_bytes": 86,
+    "header_scan_db_bytes": 201736,
+    "retention_keeps_authority_and_watermark": true
+  },
+  "bluehost_storage_receipt": {
+    "import_hashes": 8,
+    "loading_gate": true,
+    "overwrite_refused": true,
+    "atomic_rollback": true,
+    "prune_keeps_unread_and_authority": true,
+    "event_watermark_preserved": true
+  },
+  "bluehost_archive_receipt": {
+    "all_eight_python_php_digests_match": true,
+    "corrupt_archive_rejected": true
+  },
+  "default_workspace": {
+    "passed": 927,
+    "failed": 0,
+    "ignored": 3
+  },
+  "postgres_acceptance": "passed separately",
+  "transfer_measurement": "JSON response bodies only; excludes HTTP/TLS and billing",
+  "process_cache_reset_recovery": true
+}

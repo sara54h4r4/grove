@@ -65,3 +65,7 @@ jobs:
           trap 'kill "$grove_sql_pid"; cat /tmp/grove-sql-fixture.log' EXIT
           curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:45217/health
           GROVE_TEST_SQL_ENDPOINT=http://127.0.0.1:45217 cargo test -p grove-cloud --lib --locked postgres_projection -- --ignored --nocapture
+
+      - name: Bluehost PHP and MySQL storage acceptance (isolated, no cloud credentials)
+        if: runner.os == 'Linux'
+        run: python3 hosting/bluehost/tests/run.py

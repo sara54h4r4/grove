@@ -1,6 +1,7 @@
-//! Stateless Vercel backend. Indexed Postgres rows own durable state. A bounded
+//! Stateless Vercel backend. An indexed remote store owns durable state. A bounded
 //! working set is evaluated by the local engine, then changed rows and events
-//! commit together behind an atomic revision fence. History stays in Postgres.
+//! commit together behind an atomic revision fence. Cache memory owns no state.
+mod bluehost;
 mod cache;
 mod storage;
 use grove_daemon::{
@@ -82,6 +83,7 @@ pub struct Config {
     pub repository_id: String,
     token: String,
     approver: Option<String>,
+    bluehost: bool,
     client: reqwest::Client,
     endpoint: reqwest::Url,
     connection: reqwest::header::HeaderValue,
@@ -98,33 +100,51 @@ impl Config {
         if token.len() < 24 {
             return Err("GROVE_COORD_TOKEN must contain at least 24 bytes".into());
         }
-        let fallback = if migration {
-            "DATABASE_URL_UNPOOLED"
+        let bluehost = match std::env::var("GROVE_COORD_BACKEND").as_deref() {
+            Ok("bluehost") => true,
+            Ok("neon") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("GROVE_COORD_BACKEND must be bluehost or neon".into()),
+        };
+        let (endpoint, connection) = if bluehost {
+            bluehost::configuration(
+                &std::env::var("GROVE_STORE_URL").map_err(|_| "GROVE_STORE_URL is missing")?,
+                &std::env::var("GROVE_STORE_TOKEN").map_err(|_| "GROVE_STORE_TOKEN is missing")?,
+            )?
         } else {
-            "DATABASE_URL"
+            let fallback = if migration {
+                "DATABASE_URL_UNPOOLED"
+            } else {
+                "DATABASE_URL"
+            };
+            let preferred = format!("GROVE_COORD_{fallback}");
+            let connection = match std::env::var(&preferred) {
+                Ok(value) if !value.is_empty() => value,
+                Ok(_) => return Err(format!("{preferred} is empty")),
+                Err(std::env::VarError::NotPresent) => {
+                    std::env::var(fallback).map_err(|_| format!("{fallback} is missing"))?
+                }
+                Err(_) => return Err("invalid database configuration".into()),
+            };
+            let endpoint = neon_http_endpoint(&connection)?;
+            let mut connection = reqwest::header::HeaderValue::from_str(&connection)
+                .map_err(|_| "invalid database connection header")?;
+            connection.set_sensitive(true);
+            (endpoint, connection)
         };
-        let preferred = format!("GROVE_COORD_{fallback}");
-        let connection = match std::env::var(&preferred) {
-            Ok(value) if !value.is_empty() => value,
-            Ok(_) => return Err(format!("{preferred} is empty")),
-            Err(std::env::VarError::NotPresent) => {
-                std::env::var(fallback).map_err(|_| format!("{fallback} is missing"))?
-            }
-            Err(_) => return Err("invalid database configuration".into()),
-        };
-        let endpoint = neon_http_endpoint(&connection)?;
-        let mut connection = reqwest::header::HeaderValue::from_str(&connection)
-            .map_err(|_| "invalid database connection header")?;
-        connection.set_sensitive(true);
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(12))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        if bluehost {
+            builder = builder.user_agent(bluehost::USER_AGENT);
+        }
+        let client = builder
             .build()
             .map_err(|_| "cannot construct database transport")?;
         Ok(Self {
             repository_id,
             token,
             approver: std::env::var("GROVE_COORD_APPROVER_TOKEN").ok(),
+            bluehost,
             client,
             endpoint,
             connection,
@@ -147,14 +167,20 @@ impl Config {
         Ok(operator)
     }
     async fn query_measured(&self, sql: &str, params: Vec<Value>) -> Result<DbReply> {
-        // Neon's official SQL-over-HTTP protocol; all SQL is static, values bound.
-        let mut response = self
-            .client
-            .post(self.endpoint.clone())
-            .header("Neon-Connection-String", self.connection.clone())
-            .header("Neon-Raw-Text-Output", "true")
-            .header("Neon-Array-Mode", "true")
-            .json(&json!({"query":sql,"params":params}))
+        // Static, bound Neon SQL or the private Bluehost storage protocol.
+        let request = self.client.post(self.endpoint.clone());
+        let request = if self.bluehost {
+            request
+                .header("x-grove-store-token", self.connection.clone())
+                .json(&bluehost::request(sql, params)?)
+        } else {
+            request
+                .header("Neon-Connection-String", self.connection.clone())
+                .header("Neon-Raw-Text-Output", "true")
+                .header("Neon-Array-Mode", "true")
+                .json(&json!({"query":sql,"params":params}))
+        };
+        let mut response = request
             .send()
             .await
             .map_err(|_| "coordination database unavailable")?;
@@ -175,9 +201,13 @@ impl Config {
             }
             bytes.extend_from_slice(&chunk);
         }
+        let data =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid coordination database response")?;
+        if self.bluehost {
+            return bluehost::decode(data, bytes.len());
+        }
         Ok(DbReply {
-            data: serde_json::from_slice(&bytes)
-                .map_err(|_| "invalid coordination database response")?,
+            data,
             bytes: bytes.len(),
         })
     }
@@ -191,16 +221,18 @@ impl Config {
         command: &CoordCommand,
         key: &str,
         metrics: &mut RequestMetrics,
-    ) -> Result<(i64, i64, i64, Snapshot)> {
+    ) -> Result<(i64, i64, i64, Snapshot, i64)> {
         let cached = if matches!(command, CoordCommand::Sync { .. }) {
             self.cache.lock().ok().and_then(|mut cache| cache.get(key))
         } else {
             None
         };
         if let Some(mut cached) = cached {
-            let state = self
-                .query_measured(storage::CHECK, vec![json!(self.repository_id)])
-                .await?;
+            let mut params = vec![json!(self.repository_id)];
+            if self.bluehost {
+                params.push(json!(cached.revision));
+            }
+            let state = self.query_measured(storage::CHECK, params).await?;
             metrics.db_queries += 1;
             metrics.db_response_bytes += state.bytes;
             let row = state.data["rows"]
@@ -219,10 +251,21 @@ impl Config {
             };
             if high == cached.high
                 && context == cached.context
-                && cache::refresh(&mut cached.snapshot, &row[3], checkpoint_owner)?
+                && cache::refresh(
+                    &mut cached.snapshot,
+                    &row[3],
+                    checkpoint_owner,
+                    self.bluehost,
+                )?
             {
                 metrics.projection_cache_hits += 1;
-                return Ok((revision, high, context, cached.snapshot));
+                return Ok((
+                    revision,
+                    high,
+                    context,
+                    cached.snapshot,
+                    row.get(4).map(integer).transpose()?.unwrap_or(0),
+                ));
             }
             if let Ok(mut cache) = self.cache.lock() {
                 cache.remove(key);
@@ -242,15 +285,21 @@ impl Config {
             integer(&row[1])?,
             integer(&row[2])?,
             decoded(&row[3])?,
+            row.get(4).map(integer).transpose()?.unwrap_or(0),
         ))
     }
-    fn remember(&self, key: &str, context: i64, high: i64, snapshot: Snapshot) {
+    fn remember(&self, key: &str, context: i64, high: i64, revision: i64, snapshot: Snapshot) {
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(key.to_string(), context, high, snapshot);
+            cache.insert(key.to_string(), context, high, revision, snapshot);
         }
     }
     /// Run once after environment verification; migrations are tracked source.
     pub async fn migrate(&self) -> Result<()> {
+        if self.bluehost {
+            self.query(bluehost::INITIALIZE, vec![json!(self.repository_id)])
+                .await?;
+            return Ok(());
+        }
         self.query(
             include_str!("../../../hosting/migrations/001-coordination.sql"),
             vec![],
@@ -293,6 +342,9 @@ impl Config {
     /// Operator CLI only: imports into an empty destination and retains the
     /// archive. There is no overwrite/delete flag or remotely exposed tool.
     pub async fn import_snapshot(&self, archive: Archive) -> Result<()> {
+        if self.bluehost {
+            return Err("Bluehost imports require the staged row-store migration tool".into());
+        }
         if archive.repository_id != self.repository_id || archive.revision < 0 {
             return Err("archive repository/revision mismatch".into());
         }
@@ -370,7 +422,7 @@ impl Config {
         let cacheable = matches!(envelope.command, CoordCommand::Sync { .. });
         for attempt in 0..MAX_CAS_ATTEMPTS {
             metrics.attempts += 1;
-            let (revision, high, context, snapshot) = self
+            let (revision, high, context, snapshot, history_floor) = self
                 .working_set(&envelope.command, &command_json, metrics)
                 .await?;
             metrics.projected_rows += snapshot.tables.values().map(Vec::len).sum::<usize>();
@@ -389,12 +441,24 @@ impl Config {
             })
             .await
             .map_err(|_| "coordination engine unavailable")?;
-            let (snapshot, result, next_high) = evaluated?;
+            let (snapshot, mut result, next_high) = evaluated?;
+            if self.bluehost && matches!(envelope.command, CoordCommand::Sync { .. }) {
+                let after = match &envelope.command {
+                    CoordCommand::Sync { after, .. } => {
+                        after.unwrap_or_else(|| result["checkpoint"].as_i64().unwrap_or(0))
+                    }
+                    _ => 0,
+                };
+                result["history_available_after"] = json!(history_floor);
+                result["history_truncated"] = json!(after < history_floor);
+                result["poll_after_seconds"] =
+                    json!(if result["has_more"] == true { 0 } else { 30 });
+            }
             let patch = storage::changes(&before, &snapshot)?;
             if patch.is_empty() {
                 // The SELECT is the linearization point for unchanged reads.
                 if cacheable {
-                    self.remember(&command_json, context, next_high, snapshot);
+                    self.remember(&command_json, context, next_high, revision, snapshot);
                 }
                 return Ok(result);
             }
@@ -420,7 +484,13 @@ impl Config {
             {
                 if cacheable {
                     let new_context = integer(&committed.data["rows"][0][1])?;
-                    self.remember(&command_json, new_context, next_high, snapshot);
+                    self.remember(
+                        &command_json,
+                        new_context,
+                        next_high,
+                        revision + 1,
+                        snapshot,
+                    );
                 }
                 return Ok(result);
             }
@@ -515,6 +585,10 @@ fn evaluate_projected(
 #[cfg(test)]
 #[path = "postgres_tests.rs"]
 mod postgres_tests;
+
+#[cfg(test)]
+#[path = "bluehost_tests.rs"]
+mod bluehost_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,4 @@
-//! A bounded optimization, never a state owner. Each hit requires a Postgres
+//! A bounded optimization, never a state owner. Each hit requires a durable
 //! context/version check and a fresh set of heartbeat/cursor fields.
 use crate::{Result, decoded};
 use grove_daemon::coordination_snapshot::Snapshot;
@@ -13,6 +13,7 @@ const MAX_ENTRIES: usize = 32;
 pub struct Entry {
     pub context: i64,
     pub high: i64,
+    pub revision: i64,
     pub snapshot: Snapshot,
     bytes: usize,
     used: Instant,
@@ -32,7 +33,14 @@ impl Cache {
     pub fn remove(&mut self, key: &str) {
         self.entries.remove(key);
     }
-    pub fn insert(&mut self, key: String, context: i64, high: i64, snapshot: Snapshot) {
+    pub fn insert(
+        &mut self,
+        key: String,
+        context: i64,
+        high: i64,
+        revision: i64,
+        snapshot: Snapshot,
+    ) {
         let Ok(bytes) = serde_json::to_vec(&snapshot).map(|v| v.len()) else {
             return;
         };
@@ -64,6 +72,7 @@ impl Cache {
             Entry {
                 context,
                 high,
+                revision,
                 snapshot,
                 bytes,
                 used: Instant::now(),
@@ -76,17 +85,18 @@ pub fn refresh(
     snapshot: &mut Snapshot,
     clocks: &Value,
     checkpoint_owner: Option<&str>,
+    delta: bool,
 ) -> Result<bool> {
     let clocks: Vec<Vec<Value>> = decoded(clocks)?;
     let sessions = snapshot
         .tables
         .get_mut("coord_sessions")
         .ok_or("missing sessions")?;
-    if clocks.len() != sessions.len() {
+    if !delta && clocks.len() != sessions.len() {
         return Ok(false);
     }
-    for row in sessions {
-        let Some(clock) = clocks.iter().find(|clock| clock.first() == row.first()) else {
+    for clock in &clocks {
+        let Some(row) = sessions.iter_mut().find(|row| clock.first() == row.first()) else {
             return Ok(false);
         };
         if clock.len() != 4 {

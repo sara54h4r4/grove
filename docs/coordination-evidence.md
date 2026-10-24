@@ -250,3 +250,40 @@ replaces the installed executable. See the [upgrade instructions](coordination.m
 Pulling source alone leaves existing executables unchanged. CLI wrappers use
 the replacement on their next invocation; long-lived MCP processes need a
 reconnection, and future Cloud tasks need refreshed setup/cache state.
+
+## Existing PHP/MySQL hosting (2026-10-24)
+
+The new Bluehost store adapter leaves agent command validation in the existing
+Rust engine and uses an authenticated PHP endpoint with a separate InnoDB
+database. All row changes and the global watermark commit behind one locked
+revision fence. Warm cache validation reads only session clocks changed since
+the cached revision. Seven-day cleanup removes eligible events, acknowledged
+messages and expired claims while keeping unread messages and current authority.
+The API reports removed history and never resets the event watermark.
+
+The default workspace suite passes **927 tests, three ignored**. The ignored
+PostgreSQL acceptance and the new PHP/MySQL acceptance also pass when run
+explicitly against isolated fixtures. Strict all-target Clippy and formatting
+pass. The PHP 8.3 / MariaDB 11.4 fixture compares operations and persisted rows
+with the full SQLite engine, including policies, claims, transfers, exact ACKs,
+eight simultaneous same-key sends and four distinct concurrent sends. It also
+checks cold recovery, literal scope boundaries, cursor scan bounds, atomic
+rollback, import gating/checksums/overwrite refusal and retention safety.
+
+With 200 historical sessions and 1,003 acknowledged messages / 8 KB events, a
+cold sync transferred 127,660 response-body bytes, a warm unchanged sync 57,
+a heartbeat clock delta 86, and a 1,001-header scan 201,736. These are local
+fixture JSON body measurements, excluding HTTP/TLS overhead; they are not
+production bandwidth or account billing measurements. Python migration and
+PHP store digests match for all eight tables, including Unicode/escaping;
+corrupt archives are rejected before import.
+
+The public website homepage accepted a request identifying as
+`Grove-Coordination/0.4.2`; generic automated requests received a ModSecurity
+406 page. The adapter and migration transport use the Grove identification.
+This verifies neither the new API nor its database privileges. **Live Bluehost
+installation, production migration and Vercel cutover remain pending.** No
+production coordination history or existing website source was changed.
+
+See [setup and cutover](coordination-bluehost.md) and the
+[machine-readable local receipt](coordination-bluehost-receipt.json).

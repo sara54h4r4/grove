@@ -20,6 +20,7 @@ impl Harness {
                 repository_id: uuid::Uuid::new_v4().to_string(),
                 token: "fixture-participant-only".repeat(2),
                 approver: Some("fixture-operator-only".repeat(2)),
+                bluehost: false,
                 client: reqwest::Client::builder().no_proxy().build().unwrap(),
                 endpoint,
                 connection: reqwest::header::HeaderValue::from_static("fixture-unused"),
@@ -148,7 +149,7 @@ impl Harness {
     }
 }
 
-fn replace_id(value: &mut Value, old: &str, new: &str) {
+pub(super) fn replace_id(value: &mut Value, old: &str, new: &str) {
     match value {
         Value::String(s) if s == old => *s = new.into(),
         Value::String(s) if s.starts_with('{') || s.starts_with('[') => {
@@ -405,6 +406,7 @@ async fn postgres_projection_atomicity_recovery_and_history_bounds() {
         repository_id: current.repository_id.clone(),
         token: current.token.clone(),
         approver: current.approver.clone(),
+        bluehost: current.bluehost,
         client: current.client.clone(),
         endpoint: current.endpoint.clone(),
         connection: current.connection.clone(),
