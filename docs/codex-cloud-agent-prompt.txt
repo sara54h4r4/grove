@@ -94,8 +94,9 @@ database, or another coordination endpoint. Do not merge or deploy IWS changes.
 7. Supply this compact workflow as environment-level task guidance where
    supported: register the actual public native Codex ID, task, literal scope,
    and acceptance criteria; register actual child IDs with their real parent;
-   sync before significant work; use one poller per actual session, with shorter
-   intervals only for active task needs and idle backoff toward 30–60 seconds;
+   sync before significant work; use one poller per actual session, normally
+   every 30 seconds with idle backoff toward 60 seconds. Use five-second polls
+   only for a bounded active handoff; honor poll_after_seconds when supplied;
    heartbeat after Git/task/PR changes and at least once per minute
    while active; explicitly acknowledge exact approved decision revisions and
    handled messages; checkpoint only after processing a newly returned cursor.

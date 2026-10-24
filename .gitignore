@@ -27,6 +27,8 @@ mutants.out.old/
 skills-lock.json
 scripts/__pycache__/
 scripts/postgres-fixture/node_modules/
+hosting/bluehost/tests/__pycache__/
+hosting/bluehost/private/config.php
 
 # Current coordination guide and review evidence; older ignored docs stay ignored.
 !docs/
@@ -38,3 +40,5 @@ docs/*
 !docs/coordination-hosted-receipt.json
 !docs/coordination-codex-receipt.json
 !docs/coordination-egress-receipt.json
+!docs/coordination-bluehost.md
+!docs/coordination-bluehost-receipt.json

@@ -1,0 +1,35 @@
+CREATE TABLE IF NOT EXISTS grove_store_state (
+    repository_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    revision BIGINT NOT NULL DEFAULT 0,
+    event_seq BIGINT NOT NULL DEFAULT 0,
+    context_revision BIGINT NOT NULL DEFAULT 0,
+    storage_version INT NOT NULL DEFAULT 2,
+    history_floor BIGINT NOT NULL DEFAULT 0,
+    maintained_at BIGINT NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS grove_store_rows (
+    repository_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    table_name VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    row_hash BINARY(32) NOT NULL,
+    row_key TEXT NOT NULL,
+    data_json LONGTEXT NOT NULL,
+    updated_revision BIGINT NOT NULL,
+    event_seq BIGINT,
+    actor VARCHAR(256),
+    recipient VARCHAR(256),
+    sender VARCHAR(256),
+    request_key VARCHAR(256),
+    acked_at BIGINT,
+    created_at BIGINT,
+    event_kind VARCHAR(64),
+    event_scope TEXT,
+    decision_id VARCHAR(256),
+    claim_expires_at BIGINT,
+    PRIMARY KEY(repository_id,table_name,row_hash),
+    UNIQUE KEY grove_event_sequence(repository_id,event_seq),
+    UNIQUE KEY grove_message_dedup(repository_id,sender,request_key),
+    KEY grove_inbox(repository_id,table_name,recipient,acked_at,created_at),
+    KEY grove_session_changes(repository_id,table_name,updated_revision),
+    KEY grove_decisions(repository_id,table_name,decision_id),
+    KEY grove_age(repository_id,table_name,created_at)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
