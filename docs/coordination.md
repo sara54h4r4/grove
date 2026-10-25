@@ -4,10 +4,11 @@ This is the current guide for the Codex coordination milestone on `main`. It wor
 with any Git project; the first hosted instance is pinned to the IWS repository.
 Historical activity and Codex adapter documents describe earlier designs.
 
-For an existing PHP/MySQL hosting plan, the [Bluehost setup guide](coordination-bluehost.md)
-provides a store adapter that preserves the Vercel endpoint, adds bounded history
-cleanup and avoids Neon's database transfer allowance. It needs a hosted
-installation and verified cutover before an existing deployment uses it.
+The hosted IWS instance now uses the [Bluehost PHP/MySQL store](coordination-bluehost.md)
+behind its existing Vercel endpoint. The verified October 25, 2026 cutover
+preserved all live rows, added bounded history cleanup and removed Neon from
+the runtime path. Existing Grove 0.4.2 clients and Codex Cloud runtime
+Environment variables need no changes.
 
 ## What agents get
 
@@ -314,11 +315,11 @@ registry, queues/brokers, and continuous paid agent calls are outside this scope
 
 The hosted IWS instance is `https://grove-coordination.vercel.app/coord`, with repository ID
 `13f4fc87-5296-4dd7-be15-e54a1a2a290b` in the `grove-coordination` Vercel project
-under Sara Sahara's projects. Neon is managed through that Vercel integration
-(`still-brook-09634360`, resource `grove-coordination-efficient`), rather than a
-separate personal Neon project list. The previous `muddy-math-90157843` project
-is retained as a fenced archive after migration. The four Codex Cloud client
-Environment variables and endpoint stay the same. Neon Free includes
-[5 GB outgoing transfer per project per month](https://neon.com/docs/introduction/network-transfer);
-the new project supplies a fresh allowance, not unlimited transfer. See the
-[egress verification evidence](coordination-egress-receipt.json).
+under Sara Sahara's projects. Its active data is in a dedicated MySQL database
+on the existing Bluehost plan, accessed through an authenticated HTTPS store.
+The Neon projects `still-brook-09634360` and `muddy-math-90157843` are fenced
+archives. Their connection variables were removed from subsequent Vercel
+deployments. The four Codex Cloud client Environment variables and endpoint
+stay the same. See the [Bluehost migration receipt](coordination-bluehost-receipt.json).
+Bluehost's normal hosting policies still apply; agent polling no longer uses
+Neon's 5 GB monthly database transfer allowance.

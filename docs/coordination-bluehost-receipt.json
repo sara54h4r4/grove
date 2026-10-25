@@ -1,9 +1,7 @@
 {
-  "date": "2026-10-24",
   "fixture": "PHP 8.3 and MariaDB 11.4, isolated Docker network",
   "model_calls": 0,
-  "production_writes": 0,
-  "live_cutover": "pending Bluehost installation",
+  "live_cutover": "verified on 2026-10-25",
   "bluehost_receipt": {
     "php_mysql_engine_equivalence": "passed",
     "concurrent_same_key_effects": 1,
@@ -35,5 +33,79 @@
   },
   "postgres_acceptance": "passed separately",
   "transfer_measurement": "JSON response bodies only; excludes HTTP/TLS and billing",
-  "process_cache_reset_recovery": true
+  "process_cache_reset_recovery": true,
+  "fixture_date": "2026-10-24",
+  "local_fixture_production_writes": 0,
+  "hosted_cutover": {
+    "date": "2026-10-25",
+    "status": "passed",
+    "deployed_source": "8ba675fc3d5acf6998832aa882950e621b8b7850",
+    "deployment": "dpl_9bSpdPisRcc65J2D7EoAYRbLK1Mh",
+    "deployment_url": "https://grove-coordination-beefvwft8-sara-sahara-s-projects.vercel.app",
+    "agent_endpoint": "https://grove-coordination.vercel.app/coord",
+    "store_endpoint": "https://snowbyte.ca/grove-store/",
+    "php_version": "8.3.36",
+    "pdo_mysql": true,
+    "mysql_version": "8.0.46-37",
+    "source_project": "still-brook-09634360",
+    "source_fenced": true,
+    "source_revision": 15921,
+    "import_revision": 15922,
+    "event_watermark": 5408,
+    "exported_rows": 7742,
+    "migration_table_counts_and_sha256": {
+      "coord_meta": {
+        "rows": 1,
+        "sha256": "d5d0ffb9014677020d5325a749929a476065388a91f66176110ae50e57396f71"
+      },
+      "coord_sessions": {
+        "rows": 31,
+        "sha256": "e1ef6e7fa7cbf07fd9f43bc724c764a3068415f34a304b65a1b6283c032aefe5"
+      },
+      "coord_messages": {
+        "rows": 1991,
+        "sha256": "380e16b1aa19ffe2f2fd4fd8dc9f3009ed88f8229320fe8cc9da0ea2f993e110"
+      },
+      "coord_decisions": {
+        "rows": 1,
+        "sha256": "dd2ae9a1cb70348635ead3e49c8b1879bfe34a698b52105aa7812abc6f588efd"
+      },
+      "coord_decision_acks": {
+        "rows": 2,
+        "sha256": "2c54978ff0662bdb613ac80f6b67bec9ead56f58fe2434626840f7327ba150e2"
+      },
+      "coord_claims": {
+        "rows": 265,
+        "sha256": "f3d7677a8937e52c8fd06cc9fa7e1df8e04a3371505406b2e9f96021af9bd959"
+      },
+      "coord_transfers": {
+        "rows": 43,
+        "sha256": "78c832d09eba521a70adc20c46795c44fd5206558aaa24c04e2bf1374e237d77"
+      },
+      "coord_events": {
+        "rows": 5408,
+        "sha256": "aacde42e1294c84f90a920f2fa43f5db8e5dc24a5bf458cdea6ab445f8366759"
+      }
+    },
+    "all_eight_table_digests_match": true,
+    "private_archive_bytes": 51250210,
+    "private_archive_sha256": "6e866cbd672b96fdaa037ca8b3dda9e8eaef5728c64e2f00157fcf5aabf19069",
+    "authenticated_host_initialization_load_and_cas": true,
+    "representative_migration_payload_bytes": 267322,
+    "four_concurrent_retries_one_message": true,
+    "explicit_ack_and_checkpoint": true,
+    "new_deployment_recovers_previous_ack_and_dedup": true,
+    "synthetic_fixture_sessions_stopped": 6,
+    "existing_client_0_4_2_verified": true,
+    "client_reinstall_required": false,
+    "client_runtime_environment_changes": false,
+    "obsolete_neon_server_variables_removed": 32,
+    "server_authentication_settings_unchanged": true,
+    "vercel_deployment_protection_enabled": true,
+    "runtime_error_scan": "No runtime errors found from 2026-10-25T00:04:00Z through final verification",
+    "warm_sync_store_response_body_bytes": 61,
+    "existing_snowbyte_homepage_http_status": 200,
+    "iws_source_changes": 0,
+    "coordination_contents_published": false
+  }
 }

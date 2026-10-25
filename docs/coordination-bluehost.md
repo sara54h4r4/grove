@@ -6,12 +6,39 @@ rows in a **separate MySQL database and database user** on Bluehost. PHP and
 MySQL run together; agent polling does not consume a Neon transfer allowance.
 Bluehost's CPU, connection, storage and account bandwidth policies still apply.
 
-The screenshot supplied for this setup shows **Starter Hosting**, cPanel,
-File Manager, FTP and SSH key controls. It establishes the upload controls;
-the actual PHP/MySQL versions and privileges still need a hosted check.
+The installed IWS instance uses **Starter Hosting**, cPanel and File Manager.
+The installation handoff reports PHP 8.3.36, PDO MySQL and MySQL 8.0.46-37.
+Authenticated hosted checks on October 25, 2026 verified initialization,
+loading and transactional writes.
 The implementation requires PHP **8.1+**, PDO MySQL, HTTPS, and InnoDB on
 MySQL 5.7.7+/8 or MariaDB 10.4+. The automated fixture uses PHP 8.3 and
-MariaDB 11.4; it is not evidence of the Bluehost account's configuration.
+MariaDB 11.4; the hosted checks are recorded separately below.
+
+## Installed IWS instance
+
+The production agent endpoint remains
+`https://grove-coordination.vercel.app/coord`. Vercel runs the Rust engine and
+stores coordination rows through `https://snowbyte.ca/grove-store/` in a
+dedicated Bluehost MySQL database. The four Codex Cloud runtime Environment
+variables and existing Grove 0.4.2 clients stay unchanged.
+
+The October 25 cutover fenced the live Neon row store at revision **15921**,
+exported **7,742 rows**, and imported them at revision **15922**, preserving
+event watermark **5408**. Counts and SHA-256 content digests matched for all
+eight tables before accepting new coordination commands. The fresh private archive contains
+the complete migration data; the old Neon source remains fenced. Do not restore
+that source over later Bluehost writes.
+
+The deployed source is `8ba675fc3d5acf6998832aa882950e621b8b7850`.
+Authenticated installed-client checks cover Hello, isolated registration,
+delivery, concurrent same-key retries, sync, explicit ACKs and recovery.
+Unused Neon settings were removed from the Vercel project; the production
+build uses the Bluehost settings below. Vercel Deployment Protection remains
+enabled. Snowbyte's existing homepage also returns HTTP 200.
+
+See the [hosted receipt](coordination-bluehost-receipt.json) for table counts,
+digests and the production deployment. Existing five-second wrappers still
+need their own polling interval changed to the recommendation below.
 
 ## Install through cPanel
 
