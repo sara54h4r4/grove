@@ -281,9 +281,43 @@ corrupt archives are rejected before import.
 The public website homepage accepted a request identifying as
 `Grove-Coordination/0.4.2`; generic automated requests received a ModSecurity
 406 page. The adapter and migration transport use the Grove identification.
-This verifies neither the new API nor its database privileges. **Live Bluehost
-installation, production migration and Vercel cutover remain pending.** No
-production coordination history or existing website source was changed.
+Those initial probes did not verify the PHP endpoint or database privileges.
+Hosted verification and cutover followed on October 25, as recorded below.
 
 See [setup and cutover](coordination-bluehost.md) and the
 [machine-readable local receipt](coordination-bluehost-receipt.json).
+
+## Live Bluehost cutover (2026-10-25)
+
+The installed endpoint passed unauthenticated rejection, repository identity,
+authenticated initialization/load, empty-store fingerprints, transaction/CAS
+fencing and a 267,322-byte representative migration-payload check. The host
+runs PHP 8.3.36 with PDO MySQL and MySQL 8.0.46-37 according to the installation
+agent's temporary diagnostic, which was deleted after setup. No database password was
+copied out of Bluehost's private configuration.
+
+The live row store in `still-brook-09634360` was fenced at revision **15921**
+and event watermark **5408**. A fresh mode-0600 archive exported **7,742 rows**:
+1 metadata row, 31 sessions, 1,991 messages, 1 decision, 2 decision ACKs,
+265 claims, 43 transfers and 5,408 events. The Bluehost import at revision
+**15922** matched all eight table counts and SHA-256 content digests. The
+obsolete October 15 snapshot was not used. Migration data remains private.
+
+The staged build and unchanged production alias passed installed Grove 0.4.2
+Hello, isolated fixture registration, send, four concurrent same-key retries,
+sync, explicit message ACK/checkpoint, and fresh-client recovery. Retries kept
+one message ID, including after ACK, and MySQL contained the delivered message.
+Every synthetic session was marked stopped; no real session was acknowledged
+or checkpointed. No model calls or IWS source edits were used.
+
+The production source is `8ba675fc3d5acf6998832aa882950e621b8b7850`.
+The final production deployment is recorded in the receipt. The 32 unused
+Neon project variables were removed before building it; participant/operator
+authentication settings and Vercel Deployment Protection were preserved.
+New runtime requests use Bluehost. Both Neon sources remain fenced archives;
+they cannot be used to roll back later accepted messages.
+
+Production metrics showed successful operations and a warm sync store response
+of **61 JSON body bytes**. This measures store response bodies, not total
+client traffic, HTTP/TLS overhead or account billing. Snowbyte's existing
+homepage returned HTTP 200 after the database migration.
